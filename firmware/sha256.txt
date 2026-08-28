@@ -1,0 +1,3 @@
+# RP2040 Pico FM Transmitter - v0.22.1
+# Prebuilt firmware for MicroPython v1.29.0 (patch micropython-fm.patch).
+c3f3e8034174fc778d242a5f7dc22372a2a60e56e78dcd345b569e83aa7c60c5  rp2040pico_fm_firmware.uf2
