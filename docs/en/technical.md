@@ -57,30 +57,38 @@ The fractional PLL dithers fbdiv_int between two adjacent values at 1 MHz; the
 PLL's analog loop filter averages the pattern, but imperfectly.  The residual
 frequency ripple is what sets the usable SNR:
 
-- Broadcast FM (87.9MHz, 75kHz deviation, 230kHz IF): the ripple (~±10kHz)
-  stays inside the IF passband and is rejected by the 15kHz audio LPF -> clean.
-- Narrowband FM (2m 145MHz, 2.5-5kHz deviation, 12.5/25kHz channels): the
-  ripple (~±20kHz, PDM step 1.2MHz) exceeds the channel, so the carrier
-  repeatedly drops out of the IF passband -> the demodulated audio is noise
-  dominated (dev 2.5kHz: SNR <0dB; dev 12kHz + 25kHz WIDE channel: ~10dB).
-  This is a fundamental limit of the PDM-on-VCO scheme for narrowband
-  reception, not a signal-level or USB-path issue.
+- Broadcast FM (87.9MHz, 75kHz deviation, 230kHz IF): the ripple stays inside
+  the IF passband and is rejected by the 15kHz audio LPF -> clean.
+- The ripple scales with the PDM step (12MHz/total_div at the fundamental).
+  REFDIV=2 halves the step (6MHz per fbdiv LSB), which also lowers the PLL
+  loop bandwidth (PFD 12->6MHz) so the 1MHz dither is averaged more strongly.
+  This is the key to narrowband reception.
 
-Two experimental knobs reduce the ripple (both default to the stock
-behaviour, set before init() and persisted by the console):
+**Verified recipe (hardware-tested, handheld radio in WIDE/25kHz mode):**
 
-- `pico_fm.set_pdm_rate(2)` (console `pdm 2`): dither at 2 MHz instead of
-  1 MHz -> the loop filter attenuates it more strongly (~6-12dB less ripple).
-  3/4 MHz reloads approach the M0+ systick exception latency (~21 cycles) and
-  may be rate-limited or jittery - hardware test required.
-- `pico_fm.set_refdiv(2)` (console `refdiv 2`): PLL reference divider 2 halves
-  the feedback step (12MHz -> 6MHz per fbdiv LSB) and the PDM step with it
-  (~6dB less ripple).  Legal per the RP2040 datasheet (PFD 6MHz >= 5MHz
-  minimum, FBDIV stays in 16..320), but PLL lock/jitter must be re-verified.
+| band | config | result |
+|---|---|---|
+| 2m 144-148MHz (fundamental) | `reinit 145000000 12000 21` | clear, ~10dB SNR |
+| 433.92MHz (3rd harmonic of 144.64MHz) | `reinit 433920000 12500 21` + `refdiv 2` | **clear** |
+| 409.75MHz (3rd harmonic of 136.58MHz) | `reinit 409750000 12500 21` + `refdiv 2` | clear, slightly noisier |
 
-For handheld-radio voice use the 2m band with WIDE (25kHz) mode and
-~10-12kHz deviation; verify the noise improvement of `pdm 2` / `refdiv 2` on
-your own hardware before relying on them.
+A UHF target (above the ~150MHz fundamental ceiling) is carried on the 3rd
+odd harmonic of a lower fundamental: the PLL runs on target/3 and the radio
+hears target (deviation is scaled x3 too).  REFDIV=2 halves the fundamental
+PDM step to ~0.6MHz (vs 1.2MHz at refdiv 1), which is why the UHF harmonic
+links sound cleaner than the 2m fundamental at refdiv 1.
+
+- `pdm >1MHz` was hardware-tested WORSE (M0+ systick latency and PLL write
+  timing break down) - keep 1.
+- `refdiv 2` is neutral on 2m but essential for the UHF harmonic recipe.
+- A live PLL re-init without reboot (deinit/init) DEADLOCKS the board -
+  pdm/refdiv persist and apply at the next boot.
+- The emission is a few kHz off nominal (crystal tolerance x the harmonic);
+  tune the radio to the actual signal.
+- Legal/safety: the 409MHz fundamental (136.6MHz) is inside the AERONAUTICAL
+  band (118-137MHz) and radiates stronger than the 409MHz signal - suppress
+  it with a band-pass filter for any sustained use.  433MHz's fundamental is
+  in the 2m amateur band.
 
 ### 4. Diagnostics
 
