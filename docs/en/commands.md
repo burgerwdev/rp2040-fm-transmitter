@@ -14,6 +14,8 @@ All values are in Hz unless noted. Type `help` in the console anytime.
 | `freq <Hz>` | Set the modulation centre (live inside the current PLL range; reboots to that carrier outside it) | `freq 88000000` |
 | `dev <Hz>` | Set full-scale deviation (1000..half the PLL range) | `dev 40000` |
 | `reinit <carrier> <dev> [pin]` | Save new carrier/deviation/pin and reboot | `reinit 98000000 50000 21` |
+| `pdm <1\|2\|3\|4>` | PDM dither rate in MHz (1 = default; 2+ lowers narrowband noise; saves and reboots) | `pdm 2` |
+| `refdiv <1\|2>` | PLL reference divider (2 = half PDM step, ~6dB less narrowband noise; saves and reboots) | `refdiv 2` |
 | `pin <21\|23\|24\|25>` | Switch the RF output pin (saves and reboots) | `pin 21` |
 | `pwr <2\|4\|8\|12>` | RF drive strength in mA (transmit power); 8/12 give better even-harmonic suppression | `pwr 12` |
 | `rf on\|off` | RF output on/off | `rf on` |
@@ -50,6 +52,15 @@ All values are in Hz unless noted. Type `help` in the console anytime.
   get a quiet carrier.
 - **`pre`**: on = 75µs (US/EU broadcast), `50` = 50µs (China/Japan). If your
   radio's de-emphasis is 50µs, `pre 50` reduces the high-frequency hiss.
+- **Narrowband reception (handheld radios)**: the fractional PLL dithered the
+  PDM at 1 MHz leaves a residual frequency ripple that broadcast FM (75kHz
+  deviation, 230kHz IF) masks but narrowband FM (2.5-5kHz deviation,
+  12.5/25kHz channels) hears as noise.  For a handheld radio use the 2m band
+  (144-148MHz, `reinit 145000000 12000 21`), switch the radio to WIDE (25kHz)
+  and keep the deviation at ~10-12kHz for the least noisy result.  The
+  experimental `pdm 2` (faster dither, more PLL averaging) and `refdiv 2`
+  (half the PDM step) reduce that ripple by ~6-18dB in total and may make
+  12.5kHz narrowband usable - test on hardware, defaults are unchanged.
 - **`sq` (weak-sample mute)**: samples below the threshold are zeroed in the
   RX path, so faint stream noise is not modulated. Note that pausing or
   muting already parks the carrier exactly on fc (no modulation), which makes

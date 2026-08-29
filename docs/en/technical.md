@@ -51,6 +51,37 @@ PC (48 kHz stereo 16-bit PCM)
   `multicore_launch_core1_with_stack` with our own 2 KB stack in plain RAM;
 - Do not use `_thread` together with `pico_fm` (both need Core1).
 
+## Narrowband FM reception (handheld radios)
+
+The fractional PLL dithers fbdiv_int between two adjacent values at 1 MHz; the
+PLL's analog loop filter averages the pattern, but imperfectly.  The residual
+frequency ripple is what sets the usable SNR:
+
+- Broadcast FM (87.9MHz, 75kHz deviation, 230kHz IF): the ripple (~±10kHz)
+  stays inside the IF passband and is rejected by the 15kHz audio LPF -> clean.
+- Narrowband FM (2m 145MHz, 2.5-5kHz deviation, 12.5/25kHz channels): the
+  ripple (~±20kHz, PDM step 1.2MHz) exceeds the channel, so the carrier
+  repeatedly drops out of the IF passband -> the demodulated audio is noise
+  dominated (dev 2.5kHz: SNR <0dB; dev 12kHz + 25kHz WIDE channel: ~10dB).
+  This is a fundamental limit of the PDM-on-VCO scheme for narrowband
+  reception, not a signal-level or USB-path issue.
+
+Two experimental knobs reduce the ripple (both default to the stock
+behaviour, set before init() and persisted by the console):
+
+- `pico_fm.set_pdm_rate(2)` (console `pdm 2`): dither at 2 MHz instead of
+  1 MHz -> the loop filter attenuates it more strongly (~6-12dB less ripple).
+  3/4 MHz reloads approach the M0+ systick exception latency (~21 cycles) and
+  may be rate-limited or jittery - hardware test required.
+- `pico_fm.set_refdiv(2)` (console `refdiv 2`): PLL reference divider 2 halves
+  the feedback step (12MHz -> 6MHz per fbdiv LSB) and the PDM step with it
+  (~6dB less ripple).  Legal per the RP2040 datasheet (PFD 6MHz >= 5MHz
+  minimum, FBDIV stays in 16..320), but PLL lock/jitter must be re-verified.
+
+For handheld-radio voice use the 2m band with WIDE (25kHz) mode and
+~10-12kHz deviation; verify the noise improvement of `pdm 2` / `refdiv 2` on
+your own hardware before relying on them.
+
 ### 4. Diagnostics
 
 - `diag`: ISR ticks and RX frames over 1 s (both should be ~48000/s);

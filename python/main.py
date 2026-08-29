@@ -81,6 +81,10 @@ RP2040 RF Transmitter console - commands (values in Hz unless stated):
   freq <Hz>            fine-tune carrier (outside the PLL range -> reboot)
   dev <Hz>             set full-scale deviation (max: half the PLL range)
   reinit <car> <dev> [pin]   save band/deviation/RF pin, then reboot
+  pdm <1|2|3|4>       PDM dither rate in MHz (1 = default; 2+ lowers
+                      narrowband noise; saves and reboots)
+  refdiv <1|2>        PLL reference divider (2 = half PDM step, ~6dB less
+                      narrowband noise; saves and reboots)
   pin <21|23|24|25>    change RF output GPIO (saves and reboots)
   pwr <2|4|8|12>       RF output drive strength in mA (12 = max, default)
   rf on|off            RF output on/off
@@ -140,6 +144,22 @@ reinit <carrier_Hz> <deviation_Hz> [rf_pin] - switch band and reboot.
   deviation %d..%d Hz, pin 21/23/24/25.
   Example: reinit 98000000 50000 21""" % (CFG_FILE, REINIT_CARRIER_MIN, REINIT_CARRIER_MAX,
                                           REINIT_DEV_MIN, REINIT_DEV_MAX),
+    "pdm": """\
+pdm <1|2|3|4> - PDM dither rate in MHz (experimental narrowband-noise control).
+  The fractional PLL dithers the feedback divider at this rate; the PLL loop
+  filter averages it, but imperfectly - the residual ripple is what narrowband
+  (12.5/25kHz channel) radios hear as noise.  A faster rate is averaged more
+  strongly (less noise); 2 MHz usually helps, >2 MHz is close to the M0+
+  systick latency limit (test on hardware).  1 MHz = default/library-tested.
+  Saves to %s and reboots (takes effect on the next boot).
+  Example: pdm 2""" % CFG_FILE,
+    "refdiv": """\
+refdiv <1|2> - PLL reference divider (experimental narrowband-noise control).
+  REFDIV=2 halves the feedback-divider step (12MHz -> 6MHz per fbdiv LSB), so
+  the PDM dither amplitude and the residual ripple drop by ~6dB.  Legal per the
+  RP2040 datasheet (PFD >= 5MHz) but lock/jitter should be re-verified.
+  Saves to %s and reboots (takes effect on the next boot).
+  Example: refdiv 2""" % CFG_FILE,
     "pin": """\
 pin <21|23|24|25> - change the RF output GPIO, save and reboot.
   RF can ONLY go to 21/23/24/25: the RP2040 clock-output mux (clk_gpout0-3)
@@ -286,7 +306,7 @@ def save_cfg(cfg):
         print("(warning: cannot write %s)" % CFG_FILE)
 
 
-def save_current(carrier=None, deviation=None, rf_pin=None):
+def save_current(carrier=None, deviation=None, rf_pin=None, pdm_rate=None, refdiv=None):
     """Persist the current transmitter settings (defaults = current values)."""
     save_cfg({
         "carrier": carrier if carrier is not None else pico_fm.carrier(),
@@ -297,6 +317,8 @@ def save_current(carrier=None, deviation=None, rf_pin=None):
         "ws2812_pin": WS2812_PIN if LED_WS2812 else 16,
         "preemph": PREEMPH,
         "squelch": SQUELCH_PCT,
+        "pdm_rate": pdm_rate if pdm_rate is not None else pico_fm.pdm_rate(),
+        "refdiv": refdiv if refdiv is not None else pico_fm.refdiv(),
     })
 
 
@@ -371,6 +393,7 @@ def show_status():
     print("Squelch        : %s" % sq_txt)
     print("Clips          : %d (since boot)" % pico_fm.clips())
     print("RF power       : %d mA" % pico_fm.power())
+    print("PDM dither     : %d MHz (PLL refdiv %d)" % (pico_fm.pdm_rate(), pico_fm.refdiv()))
     print("LED           : %s, mode %d (0=off 1=always 2=stream 3=VU)"
           % ("WS2812 GPIO%d" % WS2812_PIN if LED_WS2812
              else "GPIO%d" % pico_fm.led_pin(), pico_fm.led_mode()))
@@ -567,6 +590,31 @@ def do_command(line):
                               % (car / 1e6, dev / 1e3, new_pin))
                         time.sleep_ms(100)
                         machine.reset()
+        elif cmd == "pdm":
+            if arg is None or arg not in ("1", "2", "3", "4"):
+                print("usage: pdm <1|2|3|4>  (PDM dither rate in MHz; 1 = default)")
+                print("  A faster dither is averaged more strongly by the PLL loop")
+                print("  filter, lowering the residual ripple heard by narrowband")
+                print("  (12.5/25kHz) FM radios.  2 MHz usually helps; >2 MHz is")
+                print("  experimental.  Saves and reboots (next boot applies it).")
+            else:
+                pico_fm.set_pdm_rate(int(arg))
+                save_current()
+                print("PDM rate set to %s MHz - rebooting..." % arg)
+                time.sleep_ms(100)
+                machine.reset()
+        elif cmd == "refdiv":
+            if arg is None or arg not in ("1", "2"):
+                print("usage: refdiv <1|2>  (PLL reference divider; 1 = default)")
+                print("  REFDIV=2 halves the PDM dither step (12MHz -> 6MHz per")
+                print("  fbdiv), cutting the narrowband ripple by ~6 dB.  Saves")
+                print("  and reboots (next boot applies it).")
+            else:
+                pico_fm.set_refdiv(int(arg))
+                save_current()
+                print("REFDIV set to %s - rebooting..." % arg)
+                time.sleep_ms(100)
+                machine.reset()
         elif cmd == "pin":
             if arg is None or arg not in ("21", "23", "24", "25"):
                 print("usage: pin <21|23|24|25>  (RF output GPIO; saves and reboots)")
@@ -801,6 +849,19 @@ def do_setup():
     if rf_pin not in (21, 23, 24, 25):
         rf_pin = 21
     RF_PIN = rf_pin
+
+    # Experimental narrowband-noise controls, applied BEFORE init() (both are
+    # read once at PLL/core1 launch): REFDIV=2 halves the PDM step, and a
+    # faster PDM dither is averaged more strongly by the PLL loop filter -
+    # both lower the residual ripple heard by narrowband (12.5/25kHz) radios.
+    refdiv = cfg_int(cfg, "refdiv", 1)
+    if refdiv not in (1, 2):
+        refdiv = 1
+    pico_fm.set_refdiv(refdiv)
+    pdm_rate = cfg_int(cfg, "pdm_rate", 1)
+    if not (1 <= pdm_rate <= 4):
+        pdm_rate = 1
+    pico_fm.set_pdm_rate(pdm_rate)
 
     ok = False
     try:
