@@ -12,7 +12,7 @@
 ## 连接
 
 - 设备会枚举为：**串口**（MicroPython REPL / `fm>` 控制台）+ **USB 音频设备**
-  （"Pico FM Sound Card"，系统里显示为 RP2040 Pico RF Transmitter / BurgerW）。
+  （"RP2040 RF Transmitter"，系统里显示为 RP2040 RF Transmitter / BurgerW）。
 - Linux 用 `screen /dev/ttyACM0 115200`；Windows 用 PuTTY（COM 口 115200）；
   Thonny 也可直接连接。
 - 上传控制台脚本（只需一次）：`mpremote cp python/main.py :main.py`。
@@ -20,7 +20,7 @@
 
 ## 播放
 
-1. 在电脑声音设置中把输出设备选为 **Pico FM Sound Card**；
+1. 在电脑声音设置中把输出设备选为 **RP2040 RF Transmitter**；
 2. 播放音乐；
 3. FM 收音机贴近 Pico，调到 **87.9MHz**。
 

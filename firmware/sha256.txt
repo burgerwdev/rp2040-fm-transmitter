@@ -1,3 +1,8 @@
-# RP2040 Pico FM Transmitter - v0.22.1
+# RP2040 Pico FM Transmitter - v0.22.9
 # Prebuilt firmware for MicroPython v1.29.0 (patch micropython-fm.patch).
-c3f3e8034174fc778d242a5f7dc22372a2a60e56e78dcd345b569e83aa7c60c5  rp2040pico_fm_firmware.uf2
+# v0.22.9: 'audio off' is now reported as muted to the host (UAC1 GET_CUR
+# mute = s_mute || !audio_route_on) so Windows shows the mute state for it
+# too. audio_start() flushes the ring buffer, so toggling audio/mute no
+# longer plays stale accumulated samples (no glitch on recovery).
+# Also includes v0.22.8-v0.22.1 fixes (see git history).
+3f67804c61060afd78fbebb415e41a18d3eebb621c11d41706a6a6f6fb992bfd  rp2040pico_fm_firmware.uf2

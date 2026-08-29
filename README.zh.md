@@ -1,6 +1,6 @@
 # RP2040 Pico FM 发射器（RP2040 Pico FM Transmitter）
 
-**版本 v0.22.1** —— MicroPython USB 声卡 + FM 发射器
+**版本 v0.22.9** —— MicroPython USB 声卡 + FM 发射器
 
 中文 · [English](README.md) · [项目主页](https://git.sr.ht/~bytewolf/rp2040-fm-transmitter)
 
@@ -22,7 +22,7 @@
    mpremote cp python/main.py :main.py
    ```
 3. 拔插（或按 RESET），等 2~3 秒，打开串口终端（115200）→ 自动进入 `fm>` 控制台；
-4. 电脑上把音频输出选为 **"Pico FM Sound Card"**，播放音乐；
+4. 电脑上把音频输出选为 **"RP2040 RF Transmitter"**，播放音乐；
 5. FM 收音机调到 **87.9MHz** 收听。
 
 详细见 [docs/zh/usage.md](docs/zh/usage.md) 与 [docs/zh/commands.md](docs/zh/commands.md)。

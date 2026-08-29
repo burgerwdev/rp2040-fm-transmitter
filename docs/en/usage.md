@@ -13,8 +13,8 @@
 ## Connecting
 
 - The device enumerates as a **serial port** (MicroPython REPL / `fm>` console)
-  plus a **USB audio device** ("Pico FM Sound Card"; shown as
-  RP2040 Pico RF Transmitter / BurgerW).
+  plus a **USB audio device** ("RP2040 RF Transmitter"; shown as
+  RP2040 RF Transmitter / BurgerW).
 - Linux: `screen /dev/ttyACM0 115200`; Windows: PuTTY (COM port, 115200);
   Thonny also works.
 - Upload the console script once: `mpremote cp python/main.py :main.py`.
@@ -23,7 +23,7 @@
 
 ## Playing
 
-1. In the OS sound settings, select **Pico FM Sound Card** as the output.
+1. In the OS sound settings, select **RP2040 RF Transmitter** as the output.
 2. Play something.
 3. Put an FM radio next to the Pico, tuned to **87.9 MHz**.
 

@@ -1,5 +1,5 @@
 diff --git a/ports/rp2/CMakeLists.txt b/ports/rp2/CMakeLists.txt
-index ee6f1b803..9d2768ca9 100644
+index ee6f1b8..9d2768c 100644
 --- a/ports/rp2/CMakeLists.txt
 +++ b/ports/rp2/CMakeLists.txt
 @@ -58,6 +58,11 @@ else()
@@ -16,7 +16,7 @@ index ee6f1b803..9d2768ca9 100644
  if(MICROPY_USER_FROZEN_MANIFEST)
 diff --git a/ports/rp2/boards/RPI_PICO_FM/board.json b/ports/rp2/boards/RPI_PICO_FM/board.json
 new file mode 100644
-index 000000000..c39d5e0b8
+index 0000000..c39d5e0
 --- /dev/null
 +++ b/ports/rp2/boards/RPI_PICO_FM/board.json
 @@ -0,0 +1,21 @@
@@ -43,7 +43,7 @@ index 000000000..c39d5e0b8
 +}
 diff --git a/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.cmake b/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.cmake
 new file mode 100644
-index 000000000..d31069607
+index 0000000..d310696
 --- /dev/null
 +++ b/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.cmake
 @@ -0,0 +1,9 @@
@@ -58,7 +58,7 @@ index 000000000..d31069607
 +set(MICROPY_HW_FM_TRANSMITTER 1)
 diff --git a/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.h b/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.h
 new file mode 100644
-index 000000000..99849d2ca
+index 0000000..c5e882d
 --- /dev/null
 +++ b/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.h
 @@ -0,0 +1,20 @@
@@ -81,10 +81,10 @@ index 000000000..99849d2ca
 +
 +// USB strings shown in the OS (Device Manager / dmesg).
 +#define MICROPY_HW_USB_MANUFACTURER_STRING      "BurgerW"
-+#define MICROPY_HW_USB_PRODUCT_FS_STRING        "RP2040 Pico RF Transmitter"
++#define MICROPY_HW_USB_PRODUCT_FS_STRING        "RP2040 RF Transmitter"
 diff --git a/ports/rp2/boards/RPI_PICO_FM/pins.csv b/ports/rp2/boards/RPI_PICO_FM/pins.csv
 new file mode 100644
-index 000000000..16e334026
+index 0000000..16e3340
 --- /dev/null
 +++ b/ports/rp2/boards/RPI_PICO_FM/pins.csv
 @@ -0,0 +1,28 @@
@@ -118,10 +118,10 @@ index 000000000..16e334026
 +LED,GPIO25
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.c b/ports/rp2/fm_transmitter/fm_modulator.c
 new file mode 100644
-index 000000000..a073cc045
+index 0000000..af19129
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.c
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,732 @@
 +/*
 + * fm_modulator.c
 + *
@@ -185,10 +185,23 @@ index 000000000..a073cc045
 +// True while the host has selected a non-zero AS alternate setting.
 +static volatile bool s_audio_active;
 +
-+// Audio quality processing state (15kHz LPF + 75us pre-emphasis + limiter).
++// True while the USB-audio -> FM routing is enabled (audio on).
++// Reported as "muted" to the host via UAC1 GET_CUR when off, so Windows
++// shows the mute state for `audio off` too.
++static volatile bool s_audio_route_on;
++
++// Audio quality processing state (15kHz LPF + 50/75us pre-emphasis +
++// limited pre-emphasis + soft limiter).
 +static volatile bool s_preemphasis_enabled;
-+static int32_t s_lp15;
-+static int32_t s_lp75;
++static volatile uint8_t s_preemph_us;   // pre-emphasis time constant: 50 or 75 us
++static int32_t s_lp15;                  // first 15 kHz band-limit LP state
++static int32_t s_lp75;                  // pre-emphasis LP state (2.1/3.2 kHz)
++static int32_t s_lp75_a;                // pre-emphasis coefficient (Q15)
++static int32_t s_lp15b;                 // second 15 kHz LP (limited pre-emphasis)
++static int32_t s_dcb_xprev;             // DC blocker (2 Hz high-pass) state
++static int32_t s_dcb_yprev;
++static volatile uint16_t s_squelch_thr; // weak-sample mute threshold (0 = off)
++static volatile uint32_t s_clips;       // limiter clip counter (since boot)
 +
 +// Diagnostics / LED state.
 +static volatile uint32_t s_last_freq;   // last frequency written to the PLL
@@ -215,6 +228,18 @@ index 000000000..a073cc045
 +static volatile uint8_t s_led_pin = FM_LED_PIN;
 +
 +// ---------------------------------------------------------------------------
++// Audio quality processing constants (all fixed-point int32; no FPU).
++// Defined here (before fm_modulator_init) so the init code can reference them.
++// ---------------------------------------------------------------------------
++
++#define FM_LP15_A_Q15   (28168)  // a = 1 - exp(-2*pi*15000/48000)  (15kHz LP)
++#define FM_LP75_A_Q15   (7953)   // a = 1 - exp(-1/(75us*48000))    (2.1kHz LP)
++#define FM_LP50_A_Q15   (11169)  // a = 1 - exp(-1/(50us*48000))    (3.2kHz LP)
++#define FM_PREEMPH_G_Q10 (5120)  // shelf gain 5.0 (~ +14dB)        (Q10)
++#define FM_DCB_A_Q15    (9)      // 2 Hz DC blocker: a = 2*pi*2/48000
++#define FM_LIM_SOFT     (26214)  // soft-knee entry, 80% of full scale
++
++// ---------------------------------------------------------------------------
 +// 48 kHz sample clock: fires once per PWM wrap.
 +// ---------------------------------------------------------------------------
 +
@@ -222,16 +247,27 @@ index 000000000..a073cc045
 +    pwm_clear_irq(FM_PWM_SLICE);
 +    s_isr_ticks++;
 +
-+    // Pop one mono sample.
++    // Pop one mono sample.  On underflow (host paused / not streaming) park
++    // the sample on 0 so the carrier sits exactly on fc instead of drifting
++    // to whatever the last frame happened to be.
 +    uint16_t tail = s_ring_tail;
 +    if (tail != s_ring_head) {
 +        s_cur_sample = s_ring[tail];
 +        s_ring_tail = (uint16_t)((tail + 1) & FM_RING_MASK);
++    } else {
++        s_cur_sample = 0;
 +    }
-+    // On underflow the previous sample is held (smooth, centre-ish frequency).
 +
-+    // FM: f = carrier + sample * deviation / 32768
-+    int32_t sample = s_cur_sample;
++    // Silence: with a zero sample (paused stream, mute, or silent frames) the
++    // carrier sits EXACTLY on fc with no modulation, so a radio tuned to fc
++    // outputs silence - the verified v0.22.3 behaviour.  No gate/sweep is
++    // needed, and an off-tune park must be avoided (a CW at the IF band edge
++    // makes the receiver's AGC/quieting cycle -> periodic plops/hiss).
++    // `sq <threshold>` instead zeroes weak samples in the RX path.
++    // Mute forces the sample to 0 here (the ring is still consumed so no
++    // backlog builds up): this bypasses any DSP transient the RX path may
++    // still be draining and silences the radio immediately.
++    int32_t sample = s_mute ? 0 : s_cur_sample;
 +    uint32_t freq = s_carrier_hz + (uint32_t)(((int64_t)sample * (int64_t)s_deviation_hz) >> 15);
 +    s_last_freq = freq;
 +    pico_fractional_pll_set_freq_u32(freq);
@@ -273,9 +309,17 @@ index 000000000..a073cc045
 +    s_volume = 32767;
 +    s_mute = false;
 +    s_audio_active = false;
++    s_audio_route_on = false;
 +    s_preemphasis_enabled = true;
++    s_preemph_us = 75;
 +    s_lp15 = 0;
 +    s_lp75 = 0;
++    s_lp75_a = FM_LP75_A_Q15;
++    s_lp15b = 0;
++    s_dcb_xprev = 0;
++    s_dcb_yprev = 0;
++    s_squelch_thr = 0;
++    s_clips = 0;
 +    s_last_freq = 0; // 0 until the 48kHz ISR has written at least once
 +    s_led_mode = 0;
 +    s_led_peak = 0;
@@ -308,11 +352,23 @@ index 000000000..a073cc045
 +}
 +
 +void fm_modulator_audio_start(void) {
++    // Drop any data that accumulated in the ring while the modulator was
++    // stopped (the RX path keeps writing): starting with a clean ring avoids
++    // playing stale audio after audio off/on or mute toggles.
++    s_ring_head = 0;
++    s_ring_tail = 0;
++    s_cur_sample = 0;
 +    fm_pwm_start();
++    s_audio_route_on = true;
 +}
 +
 +void fm_modulator_audio_stop(void) {
 +    fm_pwm_stop();
++    // 'audio off' should silence the radio: park the PLL on the EXACT carrier
++    // (no modulation -> a radio tuned to fc outputs silence).  This avoids an
++    // off-tune CW, which can make the receiver's AGC/quieting cycle audibly.
++    pico_fractional_pll_set_freq_u32(s_carrier_hz);
++    s_audio_route_on = false;
 +}
 +
 +bool fm_modulator_audio_active(void) {
@@ -339,22 +395,47 @@ index 000000000..a073cc045
 +// Audio quality processing (all fixed-point int32; RP2040 has no FPU).
 +//
 +// Chain, applied to every mono sample before it is enqueued:
-+//   1. 15 kHz one-pole low-pass  (band-limit like broadcast FM)
-+//   2. 75 us pre-emphasis        (high shelf; the FM radio's 75us de-emphasis
-+//                                 otherwise dulls the treble)
-+//   3. soft limiter              (prevent over-deviation distortion)
++//   1. 2 Hz DC blocker              (keep the FM centre exactly on carrier)
++//   2. sq <threshold> weak-sample mute (optional: zeroes faint stream noise)
++//   3. 15 kHz one-pole low-pass     (band-limit like broadcast FM)
++//   4. 50/75 us pre-emphasis        (high shelf; the FM radio's de-emphasis
++//                                    otherwise dulls the treble)
++//   5. second 15 kHz low-pass       (limited pre-emphasis: tames the boosted
++//                                    high-frequency noise before the limiter)
++//   6. soft-knee limiter            (prevent over-deviation distortion)
 +//
-+// Enabled by default; can be turned off from MicroPython with
-+// pico_fm.set_preemphasis(False).
++// Silence needs no gate: a zero sample (paused, muted or sq-zeroed) parks
++// the carrier exactly on fc, so a radio tuned to fc outputs silence.
++//
++// Enabled by default (75us); can be turned off or set to 50us from
++// MicroPython with pico_fm.set_preemphasis(False) / set_preemphasis_tc().
 +// ---------------------------------------------------------------------------
-+
-+#define FM_Q15          (32768)
-+#define FM_LP15_A_Q15   (28168)  // a = 1 - exp(-2*pi*15000/48000)  (15kHz LP)
-+#define FM_LP75_A_Q15   (7953)   // a = 1 - exp(-1/(75us*48000))    (2.1kHz LP)
-+#define FM_PREEMPH_G_Q10 (5120)  // shelf gain 5.0 (~ +14dB)        (Q10)
 +
 +// Process one mono sample: returns the sample to transmit.
 +static int16_t fm_audio_process(int16_t x) {
++    // DC blocker (2 Hz one-pole high-pass): removes any DC offset in the
++    // incoming stream so the average frequency stays exactly on the carrier.
++    int32_t dcb = s_dcb_yprev + (x - s_dcb_xprev) - ((s_dcb_yprev * FM_DCB_A_Q15) >> 15);
++    s_dcb_xprev = x;
++    s_dcb_yprev = dcb;
++    if (dcb > 32767) {
++        dcb = 32767;
++    } else if (dcb < -32768) {
++        dcb = -32768;
++    }
++    x = (int16_t)dcb;
++
++    // sq <threshold>: zero weak samples (below the threshold) so faint
++    // background noise in the stream is not modulated; the carrier then
++    // parks on fc and the radio is silent.  0 = off (default).
++    uint16_t sq = s_squelch_thr;
++    if (sq != 0) {
++        int32_t av = x < 0 ? -x : x;
++        if (av < sq) {
++            x = 0;
++        }
++    }
++
 +    if (!s_preemphasis_enabled) {
 +        return x;
 +    }
@@ -363,17 +444,42 @@ index 000000000..a073cc045
 +    int32_t lp15 = s_lp15 + ((FM_LP15_A_Q15 * (int32_t)(x - s_lp15)) >> 15);
 +    s_lp15 = lp15;
 +
-+    // 75 us pre-emphasis: high-pass component scaled and added back.
-+    int32_t lp75 = s_lp75 + ((FM_LP75_A_Q15 * (lp15 - s_lp75)) >> 15);
++    // 50/75 us pre-emphasis: high-pass component scaled and added back.
++    int32_t lp75 = s_lp75 + ((s_lp75_a * (lp15 - s_lp75)) >> 15);
 +    s_lp75 = lp75;
 +    int32_t y = lp15 + (((lp15 - lp75) * FM_PREEMPH_G_Q10) >> 10);
 +
-+    // Soft-ish limiter (hard saturation).
++    // Clamp the pre-emphasised signal back to int16 before the second
++    // low-pass: the pre-emphasis shelf gain (5x) can push y past +/-196000,
++    // and (y - lp15b) * FM_LP15_A_Q15 would overflow int32 (-> audible
++    // garbage / constant clipping on loud material).
 +    if (y > 32767) {
 +        y = 32767;
 +    } else if (y < -32768) {
 +        y = -32768;
 +    }
++
++    // Limited pre-emphasis: re-apply the 15 kHz low-pass so the boosted
++    // high-frequency noise does not hammer the limiter.
++    int32_t lp15b = s_lp15b + ((FM_LP15_A_Q15 * (y - s_lp15b)) >> 15);
++    s_lp15b = lp15b;
++    y = lp15b;
++
++    // Soft-knee limiter: linear below 80% full scale, 2:1 compression above,
++    // hard clip as the final safety net.
++    if (y > FM_LIM_SOFT) {
++        y = FM_LIM_SOFT + ((y - FM_LIM_SOFT) >> 1);
++    } else if (y < -FM_LIM_SOFT) {
++        y = -FM_LIM_SOFT + ((y + FM_LIM_SOFT) >> 1);
++    }
++    if (y > 32767) {
++        y = 32767;
++        s_clips++;
++    } else if (y < -32768) {
++        y = -32768;
++        s_clips++;
++    }
++
 +    return (int16_t)y;
 +}
 +
@@ -383,11 +489,46 @@ index 000000000..a073cc045
 +        // Reset the filter state on any change.
 +        s_lp15 = 0;
 +        s_lp75 = 0;
++        s_lp15b = 0;
 +    }
 +}
 +
 +bool fm_modulator_get_preemphasis(void) {
 +    return s_preemphasis_enabled;
++}
++
++// Select the pre-emphasis time constant (50 or 75 us).  The coefficient is
++// applied on the next sample; the filter state is reset since it depends on
++// the coefficient.
++void fm_modulator_set_preemphasis_us(uint8_t us) {
++    if (us == 50) {
++        s_lp75_a = FM_LP50_A_Q15;
++        s_preemph_us = 50;
++    } else {
++        s_lp75_a = FM_LP75_A_Q15;
++        s_preemph_us = 75;
++    }
++    s_lp15 = 0;
++    s_lp75 = 0;
++    s_lp15b = 0;
++}
++
++uint8_t fm_modulator_get_preemphasis_us(void) {
++    return s_preemph_us;
++}
++
++// Weak-sample mute (sq) threshold in raw sample amplitude; 0 disables it.
++void fm_modulator_set_squelch(uint16_t threshold) {
++    s_squelch_thr = threshold;
++}
++
++uint16_t fm_modulator_get_squelch(void) {
++    return s_squelch_thr;
++}
++
++// Number of limiter clips since the last init (diagnostics / vbar).
++uint32_t fm_modulator_clips(void) {
++    return s_clips;
 +}
 +
 +uint16_t fm_modulator_get_samples(int16_t *buf, uint16_t max) {
@@ -549,6 +690,12 @@ index 000000000..a073cc045
 +        return true;
 +    }
 +
++    // Receiving frames proves the host is streaming.  This also repairs the
++    // case where the host selected the alt setting before pico_fm.init()
++    // (fm_modulator_init resets s_audio_active) and never re-selects it, so
++    // the flag would otherwise stay false while audio actually flows.
++    s_audio_active = true;
++
 +    uint16_t volume = s_volume;
 +    bool mute = s_mute;
 +
@@ -658,7 +805,9 @@ index 000000000..a073cc045
 +bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p_request) {
 +    switch (tu_u16_high(p_request->wValue)) {
 +        case FM_CS_MUTE: {
-+            uint8_t mute = s_mute ? 1 : 0;
++            // Report muted when the console muted the stream OR the audio
++            // routing is off, so Windows shows the mute state for both.
++            uint8_t mute = (s_mute || !s_audio_route_on) ? 1 : 0;
 +            switch (p_request->bRequest) {
 +                case FM_REQ_GET_CUR:
 +                    return tud_control_xfer(rhport, p_request, &mute, 1);
@@ -707,10 +856,10 @@ index 000000000..a073cc045
 +#endif // MICROPY_HW_FM_TRANSMITTER
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.h b/ports/rp2/fm_transmitter/fm_modulator.h
 new file mode 100644
-index 000000000..6281fec9f
+index 0000000..198528f
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.h
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,125 @@
 +/*
 + * fm_modulator.h
 + *
@@ -771,9 +920,24 @@ index 000000000..6281fec9f
 +bool fm_modulator_get_mute(void);
 +
 +// Enable/disable the audio quality processing chain:
-+// 15 kHz band-limit + 75 us FM pre-emphasis + limiter (enabled by default).
++// 15 kHz band-limit + 50/75 us FM pre-emphasis + soft-knee limiter
++// (enabled by default).
 +void fm_modulator_set_preemphasis(bool enable);
 +bool fm_modulator_get_preemphasis(void);
++
++// Select the pre-emphasis time constant (50 or 75 us).  Applies from the
++// next sample; the default is 75 us (matches US/EU broadcast practice).
++void fm_modulator_set_preemphasis_us(uint8_t us);
++uint8_t fm_modulator_get_preemphasis_us(void);
++
++// Weak-sample mute threshold in raw sample amplitude (0..32767).
++// 0 disables it; samples below the threshold are zeroed in the RX path so
++// faint background noise is not modulated (the carrier then parks on fc).
++void fm_modulator_set_squelch(uint16_t threshold);
++uint16_t fm_modulator_get_squelch(void);
++
++// Number of limiter clips since the last init (diagnostics / level meter).
++uint32_t fm_modulator_clips(void);
 +
 +// Copy up to max of the most recent transmitted mono samples (chronological
 +// order, oldest first).  Returns the number of samples copied.
@@ -823,7 +987,7 @@ index 000000000..6281fec9f
 +#endif // MICROPY_INCLUDED_RP2_FM_TRANSMITTER_FM_MODULATOR_H
 diff --git a/ports/rp2/fm_transmitter/micropython.cmake b/ports/rp2/fm_transmitter/micropython.cmake
 new file mode 100644
-index 000000000..2f58f4a0c
+index 0000000..2f58f4a
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/micropython.cmake
 @@ -0,0 +1,40 @@
@@ -869,10 +1033,10 @@ index 000000000..2f58f4a0c
 +target_link_libraries(usermod INTERFACE usermod_pico_fm)
 diff --git a/ports/rp2/fm_transmitter/modpico_fm.c b/ports/rp2/fm_transmitter/modpico_fm.c
 new file mode 100644
-index 000000000..4cede81a2
+index 0000000..1a02ae3
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/modpico_fm.c
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,469 @@
 +/*
 + * modpico_fm.c
 + *
@@ -1037,7 +1201,7 @@ index 000000000..4cede81a2
 +static MP_DEFINE_CONST_FUN_OBJ_1(mod_pico_fm_set_mute_obj, mod_pico_fm_set_mute);
 +
 +// ---------------------------------------------------------------------------
-+// pico_fm.set_preemphasis(enable) - 15kHz band-limit + 75us pre-emphasis + limiter
++// pico_fm.set_preemphasis(enable) - 15kHz band-limit + pre-emphasis + limiter
 +// ---------------------------------------------------------------------------
 +
 +static mp_obj_t mod_pico_fm_set_preemphasis(mp_obj_t enable_obj) {
@@ -1155,6 +1319,46 @@ index 000000000..4cede81a2
 +}
 +static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_preemphasis_obj, mod_pico_fm_preemphasis);
 +
++// pico_fm.set_preemphasis_tc(us) - pre-emphasis time constant (50 or 75 us)
++static mp_obj_t mod_pico_fm_set_preemphasis_tc(mp_obj_t us_obj) {
++    mp_int_t us = mp_obj_get_int(us_obj);
++    if (us != 50 && us != 75) {
++        mp_raise_ValueError(MP_ERROR_TEXT("pre-emphasis must be 50 or 75 us"));
++    }
++    fm_modulator_set_preemphasis_us((uint8_t)us);
++    return mp_const_none;
++}
++static MP_DEFINE_CONST_FUN_OBJ_1(mod_pico_fm_set_preemphasis_tc_obj, mod_pico_fm_set_preemphasis_tc);
++
++// pico_fm.preemphasis_tc() -> 50 or 75
++static mp_obj_t mod_pico_fm_preemphasis_tc(void) {
++    return mp_obj_new_int_from_uint(fm_modulator_get_preemphasis_us());
++}
++static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_preemphasis_tc_obj, mod_pico_fm_preemphasis_tc);
++
++// pico_fm.set_squelch(threshold) - weak-sample mute threshold 0..32767 (0 = off)
++static mp_obj_t mod_pico_fm_set_squelch(mp_obj_t thr_obj) {
++    mp_int_t thr = mp_obj_get_int(thr_obj);
++    if (thr < 0 || thr > 32767) {
++        mp_raise_ValueError(MP_ERROR_TEXT("squelch must be 0..32767"));
++    }
++    fm_modulator_set_squelch((uint16_t)thr);
++    return mp_const_none;
++}
++static MP_DEFINE_CONST_FUN_OBJ_1(mod_pico_fm_set_squelch_obj, mod_pico_fm_set_squelch);
++
++// pico_fm.squelch() -> current weak-sample mute threshold (0 = off)
++static mp_obj_t mod_pico_fm_squelch(void) {
++    return mp_obj_new_int_from_uint(fm_modulator_get_squelch());
++}
++static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_squelch_obj, mod_pico_fm_squelch);
++
++// pico_fm.clips() -> limiter clip counter since boot (diagnostics / vbar)
++static mp_obj_t mod_pico_fm_clips(void) {
++    return mp_obj_new_int_from_uint(fm_modulator_clips());
++}
++static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_clips_obj, mod_pico_fm_clips);
++
 +// pico_fm.ring_level() -> ring buffer fill in percent (0..100)
 +static mp_obj_t mod_pico_fm_ring_level(void) {
 +    return mp_obj_new_int_from_uint(fm_modulator_ring_level());
@@ -1265,6 +1469,8 @@ index 000000000..4cede81a2
 +    { MP_ROM_QSTR(MP_QSTR_set_volume), MP_ROM_PTR(&mod_pico_fm_set_volume_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_mute), MP_ROM_PTR(&mod_pico_fm_set_mute_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_preemphasis), MP_ROM_PTR(&mod_pico_fm_set_preemphasis_obj) },
++    { MP_ROM_QSTR(MP_QSTR_set_preemphasis_tc), MP_ROM_PTR(&mod_pico_fm_set_preemphasis_tc_obj) },
++    { MP_ROM_QSTR(MP_QSTR_set_squelch), MP_ROM_PTR(&mod_pico_fm_set_squelch_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_led_mode), MP_ROM_PTR(&mod_pico_fm_set_led_mode_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_cdc_connected), MP_ROM_PTR(&mod_pico_fm_cdc_connected_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_led_pin), MP_ROM_PTR(&mod_pico_fm_set_led_pin_obj) },
@@ -1278,6 +1484,9 @@ index 000000000..4cede81a2
 +    { MP_ROM_QSTR(MP_QSTR_volume), MP_ROM_PTR(&mod_pico_fm_volume_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_muted), MP_ROM_PTR(&mod_pico_fm_muted_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_preemphasis), MP_ROM_PTR(&mod_pico_fm_preemphasis_obj) },
++    { MP_ROM_QSTR(MP_QSTR_preemphasis_tc), MP_ROM_PTR(&mod_pico_fm_preemphasis_tc_obj) },
++    { MP_ROM_QSTR(MP_QSTR_squelch), MP_ROM_PTR(&mod_pico_fm_squelch_obj) },
++    { MP_ROM_QSTR(MP_QSTR_clips), MP_ROM_PTR(&mod_pico_fm_clips_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_ring_level), MP_ROM_PTR(&mod_pico_fm_ring_level_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_led_mode), MP_ROM_PTR(&mod_pico_fm_led_mode_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_samples), MP_ROM_PTR(&mod_pico_fm_samples_obj) },
@@ -1299,7 +1508,7 @@ index 000000000..4cede81a2
 +MP_REGISTER_MODULE(MP_QSTR_pico_fm, mp_module_pico_fm);
 diff --git a/ports/rp2/fm_transmitter/pico_fractional_pll.c b/ports/rp2/fm_transmitter/pico_fractional_pll.c
 new file mode 100644
-index 000000000..c2f89a656
+index 0000000..c2f89a6
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/pico_fractional_pll.c
 @@ -0,0 +1,505 @@
@@ -1810,7 +2019,7 @@ index 000000000..c2f89a656
 +}
 diff --git a/ports/rp2/fm_transmitter/pico_fractional_pll.h b/ports/rp2/fm_transmitter/pico_fractional_pll.h
 new file mode 100644
-index 000000000..ad1ef4310
+index 0000000..ad1ef43
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/pico_fractional_pll.h
 @@ -0,0 +1,62 @@
@@ -1877,7 +2086,7 @@ index 000000000..ad1ef4310
 +
 +#endif // _PICO_FRACTIONAL_PLL_H
 diff --git a/ports/rp2/main.c b/ports/rp2/main.c
-index f43c85eee..337d4cd64 100644
+index f43c85e..337d4cd 100644
 --- a/ports/rp2/main.c
 +++ b/ports/rp2/main.c
 @@ -102,7 +102,13 @@ int main(int argc, char **argv) {
@@ -1895,7 +2104,7 @@ index f43c85eee..337d4cd64 100644
      // Hook for setting up anything that needs to be super early in the boot-up process.
      MICROPY_BOARD_STARTUP();
 diff --git a/ports/rp2/modmachine.c b/ports/rp2/modmachine.c
-index fc711770e..a6a89c9b9 100644
+index fc71177..a6a89c9 100644
 --- a/ports/rp2/modmachine.c
 +++ b/ports/rp2/modmachine.c
 @@ -103,6 +103,12 @@ static mp_obj_t mp_machine_get_freq(void) {
@@ -1912,7 +2121,7 @@ index fc711770e..a6a89c9b9 100644
      const int old_freq = clock_get_hz(clk_sys);
      rp2_flash_set_timing_for_freq(MAX(freq, old_freq));
 diff --git a/shared/tinyusb/mp_usbd.h b/shared/tinyusb/mp_usbd.h
-index e8a435f06..e83aff5c3 100644
+index e8a435f..e83aff5 100644
 --- a/shared/tinyusb/mp_usbd.h
 +++ b/shared/tinyusb/mp_usbd.h
 @@ -86,6 +86,7 @@ void mp_usbd_hex_str(char *out_str, const uint8_t *bytes, size_t bytes_len);
@@ -1924,7 +2133,7 @@ index e8a435f06..e83aff5c3 100644
  
  // Built-in USB device and configuration descriptor values
 diff --git a/shared/tinyusb/mp_usbd_descriptor.c b/shared/tinyusb/mp_usbd_descriptor.c
-index f6b1fe929..75d5a4507 100644
+index f6b1fe9..75d5a45 100644
 --- a/shared/tinyusb/mp_usbd_descriptor.c
 +++ b/shared/tinyusb/mp_usbd_descriptor.c
 @@ -84,8 +84,96 @@ const uint8_t mp_usbd_builtin_desc_cfg[MP_USBD_BUILTIN_DESC_CFG_LEN] = {
@@ -2037,7 +2246,7 @@ index f6b1fe929..75d5a4507 100644
                  break;
          }
 diff --git a/shared/tinyusb/tusb_config.h b/shared/tinyusb/tusb_config.h
-index 5432b9ca2..c956761fa 100644
+index 5432b9c..c956761 100644
 --- a/shared/tinyusb/tusb_config.h
 +++ b/shared/tinyusb/tusb_config.h
 @@ -47,6 +47,14 @@

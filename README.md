@@ -1,6 +1,6 @@
 # RP2040 Pico FM Transmitter
 
-**Version 0.22.1** — MicroPython USB sound card + FM transmitter
+**Version 0.22.9** — MicroPython USB sound card + FM transmitter
 
 [中文](README.zh.md) · English · [Project](https://git.sr.ht/~bytewolf/rp2040-fm-transmitter)
 
@@ -32,7 +32,7 @@ Turn a Raspberry Pi Pico (RP2040) into a **USB sound card + FM transmitter**:
    ```
 3. Replug (or press RESET), wait 2-3 s, open a serial terminal (115200) — the
    `fm>` console appears automatically;
-4. On the PC select **"Pico FM Sound Card"** as the audio output and play;
+4. On the PC select **"RP2040 RF Transmitter"** as the audio output and play;
 5. Tune an FM radio to **87.9 MHz**.
 
 See [docs/en/usage.md](docs/en/usage.md) and
