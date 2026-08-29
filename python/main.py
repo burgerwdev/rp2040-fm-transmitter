@@ -50,7 +50,12 @@ DEFAULT_SQUELCH = 0
 # Broad limits for the `reinit` command (the PLL itself further restricts
 # what is actually achievable; init() raises if a range is unusable).
 REINIT_CARRIER_MIN = 10_000_000
-REINIT_CARRIER_MAX = 160_000_000
+# Targets above the fundamental ceiling (~150MHz, hardware limit) are reached
+# via an ODD harmonic of the square wave (3rd/5th), which is what a UHF radio
+# actually receives.  The console converts automatically; 470MHz covers the
+# full 409/433/440 UHF receive range of a handheld radio.
+REINIT_CARRIER_MAX = 470_000_000
+HARMONIC_CEILING = 150_000_000   # max usable FUNDAMENTAL (PLL/GPOUT limit)
 REINIT_DEV_MIN = 1000
 REINIT_DEV_MAX = 500_000
 
@@ -63,11 +68,39 @@ PREEMPH = DEFAULT_PREEMPH
 # Squelch threshold in % of full scale (0 = off), mirrored from the firmware.
 SQUELCH_PCT = DEFAULT_SQUELCH
 
+# Harmonic operation: when the target frequency is above HARMONIC_CEILING the
+# PLL runs on the fundamental (target/N) and the radio hears the Nth odd
+# harmonic.  TARGET_FREQ / DEV_EFF are what the radio actually sees; the
+# firmware is fed target/N and dev_eff/N.
+HARMONIC = 1
+TARGET_FREQ = DEFAULT_CARRIER
+DEV_EFF = DEFAULT_DEVIATION
+
 
 def pll_limits():
     """(lo, hi) actual PLL output range in Hz, and max sensible deviation."""
     lo, hi = pico_fm.range()
     return lo, hi, (hi - lo) // 2
+
+
+def pick_harmonic(target):
+    """Smallest odd harmonic N whose fundamental target/N fits under the
+    hardware ceiling (odd harmonics of the 50%%-duty square wave are strong,
+    even ones are suppressed).  Returns 1 for direct (fundamental) use."""
+    for n in (3, 5, 7):
+        if target // n <= HARMONIC_CEILING:
+            return n
+    return 1
+
+
+def fundamental_of(target, harmonic):
+    """Fundamental frequency (Hz) for an effective target at the harmonic."""
+    return max(1, round(target / harmonic))
+
+
+def dev_fund_of(dev_eff, harmonic):
+    """Fundamental full-scale deviation (Hz) for an effective deviation."""
+    return max(1, round(dev_eff / harmonic))
 
 
 def build_help():
@@ -78,13 +111,16 @@ RP2040 RF Transmitter console - commands (values in Hz unless stated):
   help                 show this help
   ver                  version, firmware sha256, project links
   status               show all audio/FM parameters (incl. PLL range)
-  freq <Hz>            fine-tune carrier (outside the PLL range -> reboot)
-  dev <Hz>             set full-scale deviation (max: half the PLL range)
+  freq <Hz>            fine-tune carrier (effective freq; live within the
+                       current PLL band, else reboots; UHF targets use the
+                       3rd/5th harmonic of a <=150MHz fundamental)
+  dev <Hz>             set full-scale deviation (effective; max: half the
+                       PLL range x harmonic)
   reinit <car> <dev> [pin]   save band/deviation/RF pin, then reboot
-  pdm <1|2|3|4>       PDM dither rate in MHz (1 = default; 2+ lowers
-                      narrowband noise; saves and reboots)
-  refdiv <1|2>        PLL reference divider (2 = half PDM step, ~6dB less
-                      narrowband noise; saves and reboots)
+                       (UHF 409/433/440M targets are converted to the
+                       fundamental x harmonic automatically)
+  pdm <1|2|3|4>        PDM dither rate in MHz (1 = default; saves, reboots)
+  refdiv <1|2>         PLL reference divider (saves, reboots)
   pin <21|23|24|25>    change RF output GPIO (saves and reboots)
   pwr <2|4|8|12>       RF output drive strength in mA (12 = max, default)
   rf on|off            RF output on/off
@@ -126,40 +162,45 @@ status (alias: s) - show all audio/FM parameters.
   ring fill, volume, mute, pre-emphasis, squelch, clips, RF power, LED.
   Example: status""",
     "freq": """\
-freq <Hz> - fine-tune the carrier frequency.
-  Live within the current PLL range (shown by `status`); outside the range
-  it saves the target and reboots to it (like reinit).
-  Default carrier: %d Hz.  Range: %d..%d Hz.
-  Example: freq 88000000""" % (DEFAULT_CARRIER, REINIT_CARRIER_MIN, REINIT_CARRIER_MAX),
+freq <Hz> - set the modulation centre (EFFECTIVE frequency: what the radio
+  hears).  Live within the current PLL band; outside it the target is saved
+  and the board reboots.  UHF targets (above ~150MHz) are carried on the
+  3rd/5th harmonic of a lower fundamental and are divided down automatically.
+  Default: %d Hz.  Range: %d..%d Hz.
+  Example: freq 433920000""" % (DEFAULT_CARRIER, REINIT_CARRIER_MIN, REINIT_CARRIER_MAX),
     "dev": """\
-dev <Hz> - set the full-scale deviation.
-  A full-scale audio sample shifts the carrier by +/- this amount.
-  Range: %d..%d Hz (upper bound = half the PLL range; `status` shows it).
-  Default: %d Hz.
-  Example: dev 40000""" % (REINIT_DEV_MIN, REINIT_DEV_MAX, DEFAULT_DEVIATION),
+dev <Hz> - set the full-scale deviation (EFFECTIVE: at the radio).
+  A full-scale audio sample shifts the carrier by +/- this amount at the
+  harmonic the radio hears.  Range: %d..%d Hz (upper bound = half the PLL
+  range x harmonic; `status` shows it).  Default: %d Hz.
+  Example: dev 12000""" % (REINIT_DEV_MIN, REINIT_DEV_MAX, DEFAULT_DEVIATION),
     "reinit": """\
 reinit <carrier_Hz> <deviation_Hz> [rf_pin] - switch band and reboot.
   Saves the new carrier/deviation (and optional RF pin) to %s, then reboots.
-  carrier %d..%d Hz (FM 88..108M, 2m 144..148M),
+  carrier %d..%d Hz: FM 88..108M, 2m 144..148M, UHF 409/433/440M - UHF
+  targets are reached on the 3rd (or 5th) harmonic of a <=150MHz fundamental
+  and converted automatically; deviation is the EFFECTIVE value at the radio.
   deviation %d..%d Hz, pin 21/23/24/25.
-  Example: reinit 98000000 50000 21""" % (CFG_FILE, REINIT_CARRIER_MIN, REINIT_CARRIER_MAX,
-                                          REINIT_DEV_MIN, REINIT_DEV_MAX),
+  Example: reinit 145000000 12000 21  (2m, WIDE mode)
+  Example: reinit 433920000 12000 21   (433.92M on the 3rd harmonic)"""
+  % (CFG_FILE, REINIT_CARRIER_MIN, REINIT_CARRIER_MAX,
+     REINIT_DEV_MIN, REINIT_DEV_MAX),
     "pdm": """\
-pdm <1|2|3|4> - PDM dither rate in MHz (experimental narrowband-noise control).
+pdm <1|2|3|4> - PDM dither rate in MHz (experimental).
   The fractional PLL dithers the feedback divider at this rate; the PLL loop
   filter averages it, but imperfectly - the residual ripple is what narrowband
-  (12.5/25kHz channel) radios hear as noise.  A faster rate is averaged more
-  strongly (less noise); 2 MHz usually helps, >2 MHz is close to the M0+
-  systick latency limit (test on hardware).  1 MHz = default/library-tested.
-  Saves to %s and reboots (takes effect on the next boot).
-  Example: pdm 2""" % CFG_FILE,
+  radios hear as noise.  1 MHz = default/library-tested.  Hardware testing
+  showed rates above 1MHz sound WORSE (the M0+ systick latency and PLL write
+  timing break down), so keep 1 unless you are experimenting.  Saves to %s
+  and reboots (a live PLL re-init without reboot deadlocks the board).
+  Example: pdm 1""" % CFG_FILE,
     "refdiv": """\
-refdiv <1|2> - PLL reference divider (experimental narrowband-noise control).
-  REFDIV=2 halves the feedback-divider step (12MHz -> 6MHz per fbdiv LSB), so
-  the PDM dither amplitude and the residual ripple drop by ~6dB.  Legal per the
-  RP2040 datasheet (PFD >= 5MHz) but lock/jitter should be re-verified.
-  Saves to %s and reboots (takes effect on the next boot).
-  Example: refdiv 2""" % CFG_FILE,
+refdiv <1|2> - PLL reference divider (experimental).
+  REFDIV=2 halves the feedback-divider step (12MHz -> 6MHz per fbdiv LSB).
+  Hardware testing found it neutral (no audible change) - kept for
+  experimentation.  Default 1.  Saves to %s and reboots (a live PLL re-init
+  without reboot deadlocks the board).
+  Example: refdiv 1""" % CFG_FILE,
     "pin": """\
 pin <21|23|24|25> - change the RF output GPIO, save and reboot.
   RF can ONLY go to 21/23/24/25: the RP2040 clock-output mux (clk_gpout0-3)
@@ -311,6 +352,9 @@ def save_current(carrier=None, deviation=None, rf_pin=None, pdm_rate=None, refdi
     save_cfg({
         "carrier": carrier if carrier is not None else pico_fm.carrier(),
         "deviation": deviation if deviation is not None else pico_fm.deviation(),
+        "target_freq": TARGET_FREQ,
+        "harmonic": HARMONIC,
+        "dev_eff": DEV_EFF,
         "rf_pin": rf_pin if rf_pin is not None else RF_PIN,
         "power_ma": pico_fm.power(),
         "led_pin": "ws2812" if LED_WS2812 else pico_fm.led_pin(),
@@ -320,6 +364,65 @@ def save_current(carrier=None, deviation=None, rf_pin=None, pdm_rate=None, refdi
         "pdm_rate": pdm_rate if pdm_rate is not None else pico_fm.pdm_rate(),
         "refdiv": refdiv if refdiv is not None else pico_fm.refdiv(),
     })
+
+
+def apply_runtime_cfg(cfg, start_ws2812=False):
+    """Re-apply persisted power/LED/pre-emphasis/squelch after a PLL init
+    (fm_modulator_init resets them).  Used at boot."""
+    global PREEMPH, SQUELCH_PCT, LED_WS2812, WS2812_PIN
+    power_ma = cfg_int(cfg, "power_ma", 12)
+    if power_ma not in (2, 4, 8, 12):
+        power_ma = 12
+    pico_fm.set_power(power_ma)
+    pre = cfg.get("preemph", DEFAULT_PREEMPH)
+    if pre not in ("on", "50", "75", "off"):
+        pre = DEFAULT_PREEMPH
+    PREEMPH = pre
+    if pre == "off":
+        pico_fm.set_preemphasis(False)
+    else:
+        pico_fm.set_preemphasis(True)
+        pico_fm.set_preemphasis_tc(50 if pre == "50" else 75)
+    sq = cfg_int(cfg, "squelch", DEFAULT_SQUELCH)
+    if not (0 <= sq <= 100):
+        sq = DEFAULT_SQUELCH
+    SQUELCH_PCT = sq
+    pico_fm.set_squelch(SQUELCH_PCT * 32767 // 100)
+    led_pin = cfg.get("led_pin", 25)
+    if led_pin == "ws2812":
+        LED_WS2812 = True
+        wpin = cfg_int(cfg, "ws2812_pin", 16)
+        if not (0 <= wpin <= 29):
+            wpin = 16
+        WS2812_PIN = wpin
+        pico_fm.set_led_mode(0)  # plain-LED path off; Python drives the NeoPixel
+        if start_ws2812:
+            start_ws2812_vu(WS2812_PIN)
+    else:
+        LED_WS2812 = False
+        led_pin = cfg_int(cfg, "led_pin", 25)
+        if not (0 <= led_pin <= 29):
+            led_pin = 25
+        pico_fm.set_led_pin(led_pin)
+        pico_fm.set_led_mode(3)  # LED follows the audio level
+
+
+def band_apply(target, dev_eff, pin):
+    """Pick the harmonic for an effective target, save and reboot."""
+    global HARMONIC, TARGET_FREQ, DEV_EFF
+    TARGET_FREQ = target
+    DEV_EFF = dev_eff
+    HARMONIC = 1 if target <= HARMONIC_CEILING else pick_harmonic(target)
+    save_current(rf_pin=pin)
+    if HARMONIC > 1:
+        print("saved %.3f MHz / %.1f kHz (fundamental %.3f MHz x%d) - rebooting..."
+              % (target / 1e6, dev_eff / 1e3,
+                 fundamental_of(target, HARMONIC) / 1e6, HARMONIC))
+    else:
+        print("saved %.3f MHz / %.1f kHz - rebooting..."
+              % (target / 1e6, dev_eff / 1e3))
+    time.sleep_ms(100)
+    machine.reset()
 
 
 def start_ws2812_vu(pin):
@@ -378,10 +481,19 @@ def show_status():
     print("----- RP2040 RF Transmitter status -----")
     print("PLL ready      : %s" % ("yes" if pico_fm.ready() else "NO"))
     print("RF output      : %s (GPIO%d)" % ("ON" if RF_ON else "OFF", RF_PIN))
-    print("Carrier        : %.3f MHz (PLL range %.3f..%.3f MHz)"
-          % (pico_fm.carrier() / 1e6, lo / 1e6, hi / 1e6))
+    if HARMONIC > 1:
+        print("Carrier        : %.3f MHz effective (fundamental %.3f MHz x%d)"
+              % (TARGET_FREQ / 1e6, pico_fm.carrier() / 1e6, HARMONIC))
+        print("PLL range      : %.3f..%.3f MHz (fundamental)" % (lo / 1e6, hi / 1e6))
+    else:
+        print("Carrier        : %.3f MHz (PLL range %.3f..%.3f MHz)"
+              % (pico_fm.carrier() / 1e6, lo / 1e6, hi / 1e6))
     print("Last ISR freq  : %s" % ("%.3f MHz" % (cf / 1e6) if cf else "(ISR never ran)"))
-    print("Deviation      : %.1f kHz" % (pico_fm.deviation() / 1e3))
+    if HARMONIC > 1:
+        print("Deviation      : %.1f kHz effective (%.1f kHz fundamental)"
+              % (DEV_EFF / 1e3, pico_fm.deviation() / 1e3))
+    else:
+        print("Deviation      : %.1f kHz" % (pico_fm.deviation() / 1e3))
     print("Audio routing  : %s" % ("ON" if AUDIO_ON else "OFF"))
     print("Host streaming : %s" % ("yes" if pico_fm.audio_active() else "no"))
     print("Ring buffer    : %d%% full" % pico_fm.ring_level())
@@ -498,7 +610,7 @@ def vbar():
 
 
 def do_command(line):
-    global RF_ON, AUDIO_ON, PREEMPH, SQUELCH_PCT
+    global RF_ON, AUDIO_ON, PREEMPH, SQUELCH_PCT, HARMONIC, TARGET_FREQ, DEV_EFF
     parts = line.split()
     if not parts:
         return True
@@ -531,43 +643,49 @@ def do_command(line):
             show_status()
         elif cmd == "freq":
             if arg is None:
-                print("usage: freq <Hz>  (current PLL range %d..%d Hz; "
-                      "outside it -> reboots to that carrier)" % (lo, hi))
+                print("usage: freq <Hz>  (effective frequency; live within the current")
+                print("  PLL band, else saves and reboots)")
             else:
                 v = parse_int(arg, "freq")
                 if v is not None:
-                    if lo <= v <= hi:
-                        pico_fm.set_carrier(v)
-                        print("carrier set to %.3f MHz (live, within current range)"
-                              % (pico_fm.carrier() / 1e6))
+                    if v < REINIT_CARRIER_MIN or v > REINIT_CARRIER_MAX:
+                        print("error: carrier out of supported range %d..%d Hz"
+                              % (REINIT_CARRIER_MIN, REINIT_CARRIER_MAX))
                     else:
-                        if v < REINIT_CARRIER_MIN or v > REINIT_CARRIER_MAX:
-                            print("error: carrier out of supported range %d..%d Hz"
-                                  % (REINIT_CARRIER_MIN, REINIT_CARRIER_MAX))
+                        h = HARMONIC if HARMONIC > 1 else \
+                            (pick_harmonic(v) if v > HARMONIC_CEILING else 1)
+                        fund = fundamental_of(v, h)
+                        if h == HARMONIC and lo <= fund <= hi:
+                            pico_fm.set_carrier(fund)
+                            TARGET_FREQ = v
+                            print("carrier set to %.3f MHz (live)" % (v / 1e6))
                         else:
-                            print("target outside the current PLL range "
-                                  "(%.3f..%.3f MHz) - saving and rebooting to %.3f MHz"
-                                  % (lo / 1e6, hi / 1e6, v / 1e6))
-                            save_current(carrier=v)
-                            time.sleep_ms(100)
-                            machine.reset()
+                            print("target outside the current PLL band "
+                                  "(%.3f..%.3f MHz) - saving and rebooting"
+                                  % (lo / 1e6, hi / 1e6))
+                            band_apply(v, DEV_EFF, RF_PIN)
         elif cmd in ("dev", "deviation"):
             if arg is None:
-                print("usage: dev <Hz>  (range 1000..%d Hz)" % dev_max)
+                print("usage: dev <Hz>  (effective deviation; range %d..%d Hz)"
+                      % (REINIT_DEV_MIN, dev_max * HARMONIC))
             else:
                 v = parse_int(arg, "dev")
                 if v is not None:
-                    if v < 1000 or v > dev_max:
-                        v = clamp(v, 1000, dev_max)
-                        print("(clamped to %d Hz - half the PLL range)" % v)
-                    pico_fm.set_deviation(v)
-                    print("deviation set to %.1f kHz" % (pico_fm.deviation() / 1e3))
+                    eff_max = dev_max * HARMONIC
+                    if v < REINIT_DEV_MIN or v > eff_max:
+                        v = clamp(v, REINIT_DEV_MIN, eff_max)
+                        print("(clamped to %d Hz)" % v)
+                    DEV_EFF = v
+                    pico_fm.set_deviation(dev_fund_of(v, HARMONIC))
+                    print("deviation set to %.1f kHz" % (DEV_EFF / 1e3))
         elif cmd == "reinit":
             if arg is None or arg2 is None:
                 print("usage: reinit <carrier_Hz> <deviation_Hz> [rf_pin]")
-                print("  carrier %d..%d Hz, deviation %d..%d Hz, rf_pin 21/23/24/25"
-                      % (REINIT_CARRIER_MIN, REINIT_CARRIER_MAX,
-                         REINIT_DEV_MIN, REINIT_DEV_MAX))
+                print("  carrier %d..%d Hz (FM 88..108M, 2m 144..148M, UHF 409/433/440M"
+                      % (REINIT_CARRIER_MIN, REINIT_CARRIER_MAX))
+                print("  via 3rd/5th harmonic of a <=150MHz fundamental),")
+                print("  deviation %d..%d Hz (effective), rf_pin 21/23/24/25"
+                      % (REINIT_DEV_MIN, REINIT_DEV_MAX))
             else:
                 car = parse_int(arg, "carrier")
                 dev = parse_int(arg2, "deviation")
@@ -585,18 +703,20 @@ def do_command(line):
                         print("error: deviation out of range %d..%d Hz"
                               % (REINIT_DEV_MIN, REINIT_DEV_MAX))
                     else:
-                        save_current(carrier=car, deviation=dev, rf_pin=new_pin)
-                        print("saved %.3f MHz / %.1f kHz / GPIO%d - rebooting..."
-                              % (car / 1e6, dev / 1e3, new_pin))
-                        time.sleep_ms(100)
-                        machine.reset()
+                        h = pick_harmonic(car)
+                        fund = fundamental_of(car, h)
+                        if h > 1 and 118_000_000 <= fund <= 137_000_000:
+                            print("WARNING: fundamental %.3f MHz sits inside the AERONAUTICAL"
+                                  % (fund / 1e6))
+                            print("         band (118-137MHz)!  Suppress the fundamental with a")
+                            print("         band-pass filter before radiating, or use the 5th")
+                            print("         harmonic instead.")
+                        band_apply(car, dev, new_pin)
         elif cmd == "pdm":
             if arg is None or arg not in ("1", "2", "3", "4"):
                 print("usage: pdm <1|2|3|4>  (PDM dither rate in MHz; 1 = default)")
-                print("  A faster dither is averaged more strongly by the PLL loop")
-                print("  filter, lowering the residual ripple heard by narrowband")
-                print("  (12.5/25kHz) FM radios.  2 MHz usually helps; >2 MHz is")
-                print("  experimental.  Saves and reboots (next boot applies it).")
+                print("  Note: on hardware, rates >1MHz measured WORSE - keep 1.")
+                print("  Saves and reboots to apply.")
             else:
                 pico_fm.set_pdm_rate(int(arg))
                 save_current()
@@ -606,9 +726,8 @@ def do_command(line):
         elif cmd == "refdiv":
             if arg is None or arg not in ("1", "2"):
                 print("usage: refdiv <1|2>  (PLL reference divider; 1 = default)")
-                print("  REFDIV=2 halves the PDM dither step (12MHz -> 6MHz per")
-                print("  fbdiv), cutting the narrowband ripple by ~6 dB.  Saves")
-                print("  and reboots (next boot applies it).")
+                print("  Hardware testing found it neutral - keep 1 unless experimenting.")
+                print("  Saves and reboots to apply.")
             else:
                 pico_fm.set_refdiv(int(arg))
                 save_current()
@@ -800,8 +919,9 @@ def do_command(line):
                 elif vlo >= vhi:
                     print("error: lo must be < hi (got %d >= %d)" % (vlo, vhi))
                 else:
-                    print("sweeping %.3f..%.3f MHz step %.0f kHz (audio paused)"
-                          % (vlo / 1e6, vhi / 1e6, vstep / 1e3))
+                    print("sweeping %.3f..%.3f MHz step %.0f kHz (audio paused%s)"
+                          % (vlo / 1e6, vhi / 1e6, vstep / 1e3,
+                             "; radio hears x%d" % HARMONIC if HARMONIC > 1 else ""))
                     pico_fm.audio(False)
                     f = vlo
                     while f <= vhi:
@@ -842,13 +962,37 @@ def do_setup():
     the banner.  Runs inside the retry loop so an interrupt during setup
     restarts it instead of dropping to the plain REPL."""
     global RF_PIN, LED_WS2812, WS2812_PIN, PREEMPH, SQUELCH_PCT
+    global HARMONIC, TARGET_FREQ, DEV_EFF
     cfg = load_cfg()
-    carrier = cfg_int(cfg, "carrier", DEFAULT_CARRIER)
-    deviation = cfg_int(cfg, "deviation", DEFAULT_DEVIATION)
     rf_pin = cfg_int(cfg, "rf_pin", RF_PIN)
     if rf_pin not in (21, 23, 24, 25):
         rf_pin = 21
     RF_PIN = rf_pin
+    # Effective target frequency + harmonic: a UHF target (above the ~150MHz
+    # fundamental ceiling) is carried on the Nth odd harmonic of a lower
+    # fundamental.  Legacy configs without target_freq/harmonic behave exactly
+    # as before (harmonic 1).
+    harmonic = cfg_int(cfg, "harmonic", 1)
+    if harmonic not in (1, 3, 5, 7):
+        harmonic = 1
+    target_freq = cfg_int(cfg, "target_freq", 0)
+    if target_freq:
+        HARMONIC = harmonic
+        TARGET_FREQ = target_freq
+        carrier = fundamental_of(target_freq, harmonic)
+        dev_eff = cfg_int(cfg, "dev_eff", 0)
+        if dev_eff:
+            DEV_EFF = dev_eff
+            deviation = dev_fund_of(dev_eff, harmonic)
+        else:
+            deviation = cfg_int(cfg, "deviation", DEFAULT_DEVIATION)
+            DEV_EFF = deviation * harmonic
+    else:
+        HARMONIC = 1
+        carrier = cfg_int(cfg, "carrier", DEFAULT_CARRIER)
+        TARGET_FREQ = carrier
+        deviation = cfg_int(cfg, "deviation", DEFAULT_DEVIATION)
+        DEV_EFF = deviation
 
     # Experimental narrowband-noise controls, applied BEFORE init() (both are
     # read once at PLL/core1 launch): REFDIV=2 halves the PDM step, and a
@@ -875,6 +1019,9 @@ def do_setup():
             os.remove(CFG_FILE)
         except OSError:
             pass
+        HARMONIC = 1
+        TARGET_FREQ = DEFAULT_CARRIER
+        DEV_EFF = DEFAULT_DEVIATION
         try:
             pico_fm.init(DEFAULT_CARRIER, DEFAULT_DEVIATION, RF_PIN)
             ok = True
@@ -883,49 +1030,19 @@ def do_setup():
     if ok:
         pico_fm.enable_output(True)
         pico_fm.audio(True)
-        # Apply persisted power, then set up the LED (plain PWM GPIO or WS2812).
-        power_ma = cfg_int(cfg, "power_ma", 12)
-        if power_ma not in (2, 4, 8, 12):
-            power_ma = 12
-        pico_fm.set_power(power_ma)
-        # Apply persisted audio-processing settings: pre-emphasis (50/75us/off)
-        # and the squelch (noise gate) threshold.
-        pre = cfg.get("preemph", DEFAULT_PREEMPH)
-        if pre not in ("on", "50", "75", "off"):
-            pre = DEFAULT_PREEMPH
-        PREEMPH = pre
-        if pre == "off":
-            pico_fm.set_preemphasis(False)
-        else:
-            pico_fm.set_preemphasis(True)
-            pico_fm.set_preemphasis_tc(50 if pre == "50" else 75)
-        sq = cfg_int(cfg, "squelch", DEFAULT_SQUELCH)
-        if not (0 <= sq <= 100):
-            sq = DEFAULT_SQUELCH
-        SQUELCH_PCT = sq
-        pico_fm.set_squelch(SQUELCH_PCT * 32767 // 100)
-        led_pin = cfg.get("led_pin", 25)
-        if led_pin == "ws2812":
-            LED_WS2812 = True
-            wpin = cfg_int(cfg, "ws2812_pin", 16)
-            if not (0 <= wpin <= 29):
-                wpin = 16
-            WS2812_PIN = wpin
-            pico_fm.set_led_mode(0)  # plain-LED path off; Python drives the NeoPixel
-            start_ws2812_vu(WS2812_PIN)
-        else:
-            LED_WS2812 = False
-            led_pin = cfg_int(cfg, "led_pin", 25)
-            if not (0 <= led_pin <= 29):
-                led_pin = 25
-            pico_fm.set_led_pin(led_pin)
-            pico_fm.set_led_mode(3)  # LED follows the audio level
+        apply_runtime_cfg(cfg, start_ws2812=True)
     # Only now wait for a terminal, then print the banner to it.
     wait_terminal()
     print("==============================================")
     print(" RP2040 RF Transmitter console v%s" % VERSION)
-    print(" carrier %.3f MHz, deviation %.1f kHz, GPIO%d"
-          % (carrier / 1e6, deviation / 1e3, RF_PIN))
+    if HARMONIC > 1:
+        print(" carrier %.3f MHz (fundamental %.3f MHz x%d), deviation %.1f kHz,"
+              " GPIO%d"
+              % (TARGET_FREQ / 1e6, carrier / 1e6, HARMONIC,
+                 DEV_EFF / 1e3, RF_PIN))
+    else:
+        print(" carrier %.3f MHz, deviation %.1f kHz, GPIO%d"
+              % (carrier / 1e6, deviation / 1e3, RF_PIN))
     print("==============================================")
     if ok:
         print("Select 'RP2040 RF Transmitter' as audio output.")
