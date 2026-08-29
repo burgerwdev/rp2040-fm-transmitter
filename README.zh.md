@@ -19,8 +19,11 @@
 1. 烧录 `firmware/rp2040pico_fm_firmware.uf2`（BOOTSEL 拖拽，或 `tools/flash.sh`）；
 2. 上传控制台脚本：
    ```
-   mpremote cp python/main.py :main.py
+   tools/upload.sh
    ```
+   （FM 控制台会抢占 REPL，直接 `mpremote cp` 会报 "could not enter raw repl"；
+   该脚本自动让控制台 `exit` 后上传并重启。手动等效步骤：串口终端在 `fm>`
+   输入 `exit`，再执行 `mpremote resume fs cp python/main.py :main.py`。）
 3. 拔插（或按 RESET），等 2~3 秒，打开串口终端（115200）→ 自动进入 `fm>` 控制台；
 4. 电脑上把音频输出选为 **"RP2040 RF Transmitter"**，播放音乐；
 5. FM 收音机调到 **87.9MHz** 收听。

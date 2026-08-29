@@ -28,8 +28,12 @@ Turn a Raspberry Pi Pico (RP2040) into a **USB sound card + FM transmitter**:
    `tools/flash.sh`);
 2. Upload the console script:
    ```
-   mpremote cp python/main.py :main.py
+   tools/upload.sh
    ```
+   (This handles the FM console holding the REPL - a plain `mpremote cp`
+   fails with "could not enter raw repl".  Equivalent manual steps: in a
+   serial terminal type `exit` at the `fm>` prompt, then
+   `mpremote resume fs cp python/main.py :main.py`.)
 3. Replug (or press RESET), wait 2-3 s, open a serial terminal (115200) — the
    `fm>` console appears automatically;
 4. On the PC select **"RP2040 RF Transmitter"** as the audio output and play;
