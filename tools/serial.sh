@@ -34,7 +34,10 @@ fi
 
 if command -v tio >/dev/null 2>&1; then
     echo "==> tio ${PORT} @115200 (auto-reconnects on Pico reboots; Ctrl-T Q to quit)"
-    exec tio -b 115200 --auto-reconnect "${PORT}"
+    # tio reconnects automatically when the device reappears (unless
+    # --no-reconnect).  Without the udev symlink, add -a new so it re-picks
+    # the next /dev/ttyACM* when the number changes.
+    exec tio -b 115200 "${PORT}"
 fi
 
 echo "==> tio not found - using a screen re-attach loop."
