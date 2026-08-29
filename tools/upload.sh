@@ -9,13 +9,14 @@
 #
 # This script:
 #   1. opens the USB CDC port (DTR assert lets main.py finish waiting for a
-#      terminal), waits for the `fm>` prompt and types `exit` so the console
-#      returns to the plain REPL;
+#      terminal), normalises the REPL state, and if the console is up types
+#      `exit` (retried) so it returns to the plain REPL;
 #   2. uploads main.py with `mpremote resume fs cp` (resume = no soft reset,
 #      so the console does not grab the REPL again);
 #   3. resets the board with machine.reset() so the new main.py runs.
 #
-# Works in all states: console up, plain REPL, or no main.py yet (first boot).
+# Works in all states: console up, plain REPL, raw REPL leftover, or no
+# main.py yet (first boot).
 #
 # Usage: ./upload.sh [path-to-main.py]
 set -euo pipefail
@@ -29,7 +30,7 @@ command -v mpremote >/dev/null 2>&1 || { echo "error: mpremote not found (pip in
 # pyserial, which the console-exit step needs).
 MPY="$(head -1 "$(command -v mpremote)" | sed 's/^#!//')"
 
-# 1. Ask the running console to exit back to the plain REPL.
+# 1. Normalise the REPL and ask the FM console (if running) to exit.
 echo "==> asking the FM console to exit (it holds the REPL)..."
 "${MPY}" - <<'EOF'
 import glob, sys, time
@@ -48,24 +49,41 @@ if port is None:
     sys.exit("error: no Pico serial port found (/dev/ttyACM*) - is it plugged in?")
 
 print("   port: %s" % port)
-buf = b""
+
+def drain(sec):
+    end = time.time() + sec
+    out = b""
+    while time.time() < end:
+        b = s.read(512)
+        if b:
+            out += b
+    return out
+
+buf = drain(0.5)
+if b"raw REPL" in buf:
+    # Left over from a previous mpremote session: exit raw REPL to be safe.
+    s.write(b"\x02")   # Ctrl-B: back to the friendly REPL
+    buf += drain(0.3)
+
+# If the console is up, tell it to exit (retry in case the prompt was not
+# ready when the first attempt was sent).
 sent = False
-deadline = time.time() + 10
-while time.time() < deadline:
-    b = s.read(256)
-    if b:
-        buf += b
-    if not sent and b"fm>" in buf:
+for attempt in range(4):
+    if b">>>" in buf:
+        print("   board already at the plain REPL")
+        break
+    if b"fm>" in buf:
         s.write(b"exit\r\n")
         sent = True
-        print("   console seen, sending 'exit'")
+        print("   console seen (attempt %d), sending 'exit'" % (attempt + 1))
+    buf += drain(1.0)
     if sent and b">>>" in buf:
         print("   console exited, back at the plain REPL")
         break
 else:
-    # No console prompt: the board is already at the plain REPL (or main.py
-    # is absent / console already stopped).  Harmless - proceed to upload.
-    print("   (no console prompt; continuing)")
+    print("   WARNING: did not reach the plain REPL; captured output was:")
+    print("      %r" % buf)
+    print("   (continuing - mpremote may still recover)")
 s.close()
 EOF
 
