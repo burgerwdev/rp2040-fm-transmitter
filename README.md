@@ -1,6 +1,6 @@
 # RP2040 Pico FM Transmitter
 
-**Version 0.22.9** — MicroPython USB sound card + FM transmitter
+**Version 0.23.1** — MicroPython USB sound card + FM transmitter
 
 [中文](README.zh.md) · English · [Project](https://git.sr.ht/~bytewolf/rp2040-fm-transmitter)
 

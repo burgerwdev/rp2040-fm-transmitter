@@ -20,7 +20,7 @@ import time
 
 import pico_fm
 
-VERSION = "0.22.9"          # console release version (see release README)
+VERSION = "0.23.1"          # console release version (see release README)
 
 # SHA-256 of the firmware this console is shipped with
 # (release/firmware/rp2040pico_fm_firmware.uf2).  Shown by `ver`.

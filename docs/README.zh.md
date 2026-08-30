@@ -1,6 +1,6 @@
 # 文档
 
-RP2040 Pico FM 发射器 **v0.22.1** —— 文档索引。
+RP2040 Pico FM 发射器 **v0.23.1** —— 文档索引。
 
 > [English](README.md) · 中文
 
