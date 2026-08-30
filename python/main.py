@@ -24,7 +24,7 @@ VERSION = "0.22.9"          # console release version (see release README)
 
 # SHA-256 of the firmware this console is shipped with
 # (release/firmware/rp2040pico_fm_firmware.uf2).  Shown by `ver`.
-FW_SHA256 = "8b002a5096a2d991256a94d7dae82797c12720aebbf8651bcb4e93598d961583"
+FW_SHA256 = "9f0f5e0fa9c2ffac0eda97cf6731dbc694b2a693a326ab1ae7781fd864fc0869"
 
 # Project links shown by the `ver` command.
 PROJECT_URL = "https://git.sr.ht/~bytewolf/rp2040-fm-transmitter"
@@ -76,6 +76,20 @@ HARMONIC = 1
 TARGET_FREQ = DEFAULT_CARRIER
 DEV_EFF = DEFAULT_DEVIATION
 
+# Silence handling.  Broadcast FM (87.5-108MHz) parks the unmodulated carrier
+# on fc so an FM radio outputs silence; narrowband bands (2m/UHF, handheld
+# radios) key the RF output off on silence instead, because a parked
+# off-tune carrier is heard as a continuous tone by a handheld receiver.
+# "auto" derives the mode from the band; the console stores the resolved
+# value in /fm_cfg.json after each band change.
+SILENCE_MODE = "auto"      # "auto" | "park" | "gate"
+
+
+def silence_gate_resolve(target):
+    """Resolve the silence-gate mode for a band: broadcast FM parks the
+    carrier; everything else (narrowband, handheld radios) gates it off."""
+    return not (87_500_000 <= target <= 108_000_000)
+
 
 def pll_limits():
     """(lo, hi) actual PLL output range in Hz, and max sensible deviation."""
@@ -119,6 +133,11 @@ RP2040 RF Transmitter console - commands (values in Hz unless stated):
   reinit <car> <dev> [pin]   save band/deviation/RF pin, then reboot
                        (UHF 409/433/440M targets are converted to the
                        fundamental x harmonic automatically)
+  band <fm|2m|409|433>  one-command band preset (sets refdiv + silence gate)
+  silence <auto|park|gate>  silent-state behaviour: auto = FM parks the
+                       carrier, narrowband keys RF off (handheld squelch)
+  pre on|off|50|75|300  15kHz band-limit + pre-emphasis + limiter
+                       (300us = handheld-radio standard)
   pdm <1|2|3|4>        PDM dither rate in MHz (1 = default; saves, reboots)
   refdiv <1|2>         PLL reference divider (saves, reboots)
   pin <21|23|24|25>    change RF output GPIO (saves and reboots)
@@ -235,11 +254,32 @@ mute on|off - mute/unmute the audio stream (routing stays on).
   instead; `vol 0` is another way to get a quiet carrier.
   Example: mute on""",
     "pre": """\
-pre on|off|50|75 - 15kHz band-limit + pre-emphasis + soft limiter.
-  on = 75us (default, US/EU broadcast), 50 = 50us (China/Japan), off = no
+pre on|off|50|75|300 - 15kHz band-limit + pre-emphasis + soft limiter.
+  on = 75us (default, US/EU broadcast), 50 = 50us (China/Japan), 300 = 300us
+  (handheld-radio / voice standard - pick this for a walkie-talkie), off = no
   processing.  Pick the value matching your radio's de-emphasis to reduce
   high-frequency hiss.  Saved to %s.
-  Example: pre 50""" % CFG_FILE,
+  Example: pre 300""" % CFG_FILE,
+    "band": """\
+band <fm|2m|409|433> - one-command band preset (saves and reboots).
+  fm   98.0 MHz   FM broadcast (parked-carrier silence)
+  2m   145.0 MHz  2m amateur (refdiv 1, WIDE mode, RF gated when silent)
+  409  409.75 MHz PRC license-free PMR on the 3rd harmonic (refdiv 2, gate)
+  433  433.92 MHz ISM/ham on the 3rd harmonic (refdiv 2, gate)
+  Sets the carrier/deviation, the PLL reference divider and the silence mode
+  automatically.  Custom bands: use `reinit`.
+  Example: band 433""",
+    "silence": """\
+silence <auto|park|gate> - what to radiate when there is no audio.
+  park - leave the unmodulated carrier on fc (broadcast FM: an FM radio
+    outputs silence on a parked carrier).  For a handheld radio an off-tune
+    parked carrier is heard as a continuous tone, so:
+  gate - key the RF output OFF on silence (no stream / mute / audio off);
+    the handheld's squelch closes -> silence.  RF returns as soon as audio
+    flows (PTT-style).
+  auto (default) - park on FM broadcast bands, gate on 2m/UHF.
+  Applies immediately and is saved to %s.
+  Example: silence auto""" % CFG_FILE,
     "sq": """\
 sq <0-100> - weak-sample mute threshold in % of full scale.
   Samples below the threshold are zeroed (not modulated), so faint
@@ -361,32 +401,44 @@ def save_current(carrier=None, deviation=None, rf_pin=None, pdm_rate=None, refdi
         "ws2812_pin": WS2812_PIN if LED_WS2812 else 16,
         "preemph": PREEMPH,
         "squelch": SQUELCH_PCT,
+        "silence_mode": SILENCE_MODE,
         "pdm_rate": pdm_rate if pdm_rate is not None else pico_fm.pdm_rate(),
         "refdiv": refdiv if refdiv is not None else pico_fm.refdiv(),
     })
 
 
 def apply_runtime_cfg(cfg, start_ws2812=False):
-    """Re-apply persisted power/LED/pre-emphasis/squelch after a PLL init
-    (fm_modulator_init resets them).  Used at boot."""
-    global PREEMPH, SQUELCH_PCT, LED_WS2812, WS2812_PIN
+    """Re-apply persisted power/LED/pre-emphasis/squelch/silence-gate after a
+    PLL init (fm_modulator_init resets them).  Used at boot."""
+    global PREEMPH, SQUELCH_PCT, LED_WS2812, WS2812_PIN, SILENCE_MODE
     power_ma = cfg_int(cfg, "power_ma", 12)
     if power_ma not in (2, 4, 8, 12):
         power_ma = 12
     pico_fm.set_power(power_ma)
     pre = cfg.get("preemph", DEFAULT_PREEMPH)
-    if pre not in ("on", "50", "75", "off"):
+    if pre not in ("on", "50", "75", "300", "off"):
         pre = DEFAULT_PREEMPH
     PREEMPH = pre
     if pre == "off":
         pico_fm.set_preemphasis(False)
     else:
         pico_fm.set_preemphasis(True)
-        pico_fm.set_preemphasis_tc(50 if pre == "50" else 75)
+        pico_fm.set_preemphasis_tc({"50": 50, "300": 300}.get(pre, 75))
     sq = cfg_int(cfg, "squelch", DEFAULT_SQUELCH)
     if not (0 <= sq <= 100):
         sq = DEFAULT_SQUELCH
     SQUELCH_PCT = sq
+    # Silence handling: broadcast FM parks the unmodulated carrier on fc;
+    # narrowband (handheld-radio) bands key the RF output off on silence so
+    # the radio's squelch closes instead of hearing an off-tune parked CW.
+    smode = cfg.get("silence_mode", "auto")
+    if smode not in ("auto", "park", "gate"):
+        smode = "auto"
+    SILENCE_MODE = smode
+    if smode == "auto":
+        pico_fm.set_silence_gate(silence_gate_resolve(TARGET_FREQ))
+    else:
+        pico_fm.set_silence_gate(smode == "gate")
     pico_fm.set_squelch(SQUELCH_PCT * 32767 // 100)
     led_pin = cfg.get("led_pin", 25)
     if led_pin == "ws2812":
@@ -409,10 +461,17 @@ def apply_runtime_cfg(cfg, start_ws2812=False):
 
 def band_apply(target, dev_eff, pin):
     """Pick the harmonic for an effective target, save and reboot."""
-    global HARMONIC, TARGET_FREQ, DEV_EFF
+    global HARMONIC, TARGET_FREQ, DEV_EFF, SILENCE_MODE
     TARGET_FREQ = target
     DEV_EFF = dev_eff
     HARMONIC = 1 if target <= HARMONIC_CEILING else pick_harmonic(target)
+    # Band-appropriate PLL reference divider: refdiv 1 for broadcast FM / 2m
+    # (the proven-clean parked-carrier behaviour), refdiv 2 for UHF harmonic
+    # links (half PDM step).  A leftover refdiv 2 on FM changes the parked
+    # PDM pattern and puts an audible idle tone on the silent carrier - this
+    # is what broke the FM pause-silence after a previous UHF session.
+    pico_fm.set_refdiv(2 if target > HARMONIC_CEILING else 1)
+    SILENCE_MODE = "auto"   # band-derived: FM parks the carrier, NFM gates it
     save_current(rf_pin=pin)
     if HARMONIC > 1:
         print("saved %.3f MHz / %.1f kHz (fundamental %.3f MHz x%d) - rebooting..."
@@ -499,10 +558,17 @@ def show_status():
     print("Ring buffer    : %d%% full" % pico_fm.ring_level())
     print("Volume         : %d%%" % vol_pct(pico_fm.volume()))
     print("Mute           : %s" % ("yes" if pico_fm.muted() else "no"))
-    pre_txt = {"on": "on (75us)", "50": "on (50us)", "off": "off"}.get(PREEMPH, "on (75us)")
+    pre_txt = {"on": "on (75us)", "50": "on (50us)", "300": "on (300us)", "off": "off"}.get(PREEMPH, "on (75us)")
     print("Pre-emphasis   : %s" % pre_txt)
     sq_txt = "off" if SQUELCH_PCT == 0 else "%d%%" % SQUELCH_PCT
     print("Squelch        : %s" % sq_txt)
+    gate_on = pico_fm.silence_gate()
+    gated_now = pico_fm.rf_gated()
+    if gate_on:
+        print("Silence        : gate (RF keyed off when silent%s)"
+              % (" - gated now" if gated_now else ""))
+    else:
+        print("Silence        : park (unmodulated carrier on fc)")
     print("Clips          : %d (since boot)" % pico_fm.clips())
     print("RF power       : %d mA" % pico_fm.power())
     print("PDM dither     : %d MHz (PLL refdiv %d)" % (pico_fm.pdm_rate(), pico_fm.refdiv()))
@@ -610,7 +676,7 @@ def vbar():
 
 
 def do_command(line):
-    global RF_ON, AUDIO_ON, PREEMPH, SQUELCH_PCT, HARMONIC, TARGET_FREQ, DEV_EFF
+    global RF_ON, AUDIO_ON, PREEMPH, SQUELCH_PCT, HARMONIC, TARGET_FREQ, DEV_EFF, SILENCE_MODE
     parts = line.split()
     if not parts:
         return True
@@ -734,6 +800,48 @@ def do_command(line):
                 print("REFDIV set to %s - rebooting..." % arg)
                 time.sleep_ms(100)
                 machine.reset()
+        elif cmd == "band":
+            BANDS = {
+                "fm":  (98_000_000, 75_000),     # FM broadcast (centre)
+                "2m":  (145_000_000, 12_000),    # 2m amateur, WIDE mode
+                "409": (409_750_000, 12_500),    # PRC license-free PMR, 3rd harm.
+                "433": (433_920_000, 12_500),    # 433.92 ISM/ham, 3rd harmonic
+            }
+            if arg is None or arg.lower() not in BANDS:
+                print("usage: band <fm|2m|409|433>")
+                for k, (f, d) in BANDS.items():
+                    print("  %-4s -> %.3f MHz / %.1f kHz%s" % (
+                        k, f / 1e6, d / 1e3,
+                        " (3rd harmonic)" if f > HARMONIC_CEILING else ""))
+            else:
+                target, dev = BANDS[arg.lower()]
+                # The verified UHF recipe uses refdiv 2 (half PDM step).
+                pico_fm.set_refdiv(2 if target > HARMONIC_CEILING else 1)
+                h = pick_harmonic(target)
+                fund = fundamental_of(target, h)
+                if h > 1 and 118_000_000 <= fund <= 137_000_000:
+                    print("WARNING: fundamental %.3f MHz sits inside the AERONAUTICAL"
+                          % (fund / 1e6))
+                    print("         band (118-137MHz)!  Add a band-pass filter to")
+                    print("         suppress the fundamental before radiating.")
+                print("band %s -> " % arg.lower(), end="")
+                band_apply(target, dev, RF_PIN)
+        elif cmd == "silence":
+            if arg is None or arg not in ("auto", "park", "gate"):
+                print("usage: silence <auto|park|gate>")
+                print("  auto (default) - FM broadcast parks the carrier on fc;")
+                print("    narrowband bands (2m/UHF) gate the RF off on silence")
+                print("    (handheld squelch closes -> no off-tune CW tone).")
+                print("  park - always leave the unmodulated carrier on fc.")
+                print("  gate - always key the RF off when there is no audio.")
+                print("  Applies immediately; saved to config.")
+            else:
+                SILENCE_MODE = arg
+                gate = silence_gate_resolve(TARGET_FREQ) if arg == "auto" else (arg == "gate")
+                pico_fm.set_silence_gate(gate)
+                save_current()
+                print("silence mode: %s (RF %s when silent)"
+                      % (arg, "off" if gate else "parked on fc"))
         elif cmd == "pin":
             if arg is None or arg not in ("21", "23", "24", "25"):
                 print("usage: pin <21|23|24|25>  (RF output GPIO; saves and reboots)")
@@ -793,7 +901,7 @@ def do_command(line):
                 pico_fm.set_mute(arg == "on")
                 print("mute %s" % arg)
         elif cmd == "pre":
-            if arg in ("on", "off", "50", "75"):
+            if arg in ("on", "off", "50", "75", "300"):
                 if arg in ("on", "75"):
                     PREEMPH = "on"
                     pico_fm.set_preemphasis(True)
@@ -804,13 +912,18 @@ def do_command(line):
                     pico_fm.set_preemphasis(True)
                     pico_fm.set_preemphasis_tc(50)
                     print("pre-emphasis on (50us)")
+                elif arg == "300":
+                    PREEMPH = "300"
+                    pico_fm.set_preemphasis(True)
+                    pico_fm.set_preemphasis_tc(300)
+                    print("pre-emphasis on (300us - handheld radio)")
                 else:
                     PREEMPH = "off"
                     pico_fm.set_preemphasis(False)
                     print("pre-emphasis off")
                 save_current()
             else:
-                print("usage: pre on|off|50|75  (on = 75us)")
+                print("usage: pre on|off|50|75|300  (on = 75us; 300 = handheld radio)")
         elif cmd == "sq":
             if arg is None:
                 print("usage: sq <0-100>  (0 = off, default)")

@@ -118,10 +118,10 @@ index 0000000..16e3340
 +LED,GPIO25
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.c b/ports/rp2/fm_transmitter/fm_modulator.c
 new file mode 100644
-index 0000000..af19129
+index 0000000..5ebd45b
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.c
-@@ -0,0 +1,732 @@
+@@ -0,0 +1,818 @@
 +/*
 + * fm_modulator.c
 + *
@@ -193,7 +193,7 @@ index 0000000..af19129
 +// Audio quality processing state (15kHz LPF + 50/75us pre-emphasis +
 +// limited pre-emphasis + soft limiter).
 +static volatile bool s_preemphasis_enabled;
-+static volatile uint8_t s_preemph_us;   // pre-emphasis time constant: 50 or 75 us
++static volatile uint16_t s_preemph_us;  // pre-emphasis time constant: 50/75/300 us
 +static int32_t s_lp15;                  // first 15 kHz band-limit LP state
 +static int32_t s_lp75;                  // pre-emphasis LP state (2.1/3.2 kHz)
 +static int32_t s_lp75_a;                // pre-emphasis coefficient (Q15)
@@ -235,6 +235,7 @@ index 0000000..af19129
 +#define FM_LP15_A_Q15   (28168)  // a = 1 - exp(-2*pi*15000/48000)  (15kHz LP)
 +#define FM_LP75_A_Q15   (7953)   // a = 1 - exp(-1/(75us*48000))    (2.1kHz LP)
 +#define FM_LP50_A_Q15   (11169)  // a = 1 - exp(-1/(50us*48000))    (3.2kHz LP)
++#define FM_LP300_A_Q15  (2199)   // a = 1 - exp(-1/(300us*48000))   (530Hz LP)
 +#define FM_PREEMPH_G_Q10 (5120)  // shelf gain 5.0 (~ +14dB)        (Q10)
 +#define FM_DCB_A_Q15    (9)      // 2 Hz DC blocker: a = 2*pi*2/48000
 +#define FM_LIM_SOFT     (26214)  // soft-knee entry, 80% of full scale
@@ -242,6 +243,19 @@ index 0000000..af19129
 +// ---------------------------------------------------------------------------
 +// 48 kHz sample clock: fires once per PWM wrap.
 +// ---------------------------------------------------------------------------
++
++// Silence handling for narrowband (handheld-radio) operation:
++// - Broadcast FM (s_gate_silent == false, default): on silence the carrier
++//   parks EXACTLY on fc -> an FM radio tuned to fc outputs silence.
++// - Narrowband (s_gate_silent == true): on silence the RF output is turned
++//   OFF (PTT-style keying).  A parked unmodulated carrier is a few kHz off
++//   the radio's tuning (crystal tolerance x harmonic) and a handheld receiver
++//   hears it as a continuous tone - keying off instead lets its squelch close
++//   (silence).  Re-enabled as soon as audio flows again.
++#define FM_GATE_TICKS  (2000)   // ~42ms of silence before keying off
++static volatile bool s_gate_silent;    // key RF on silence (NFM mode)
++static volatile bool s_rf_gated;       // output currently keyed off
++static volatile uint32_t s_empty_ticks; // consecutive silent ticks
 +
 +static void __time_critical_func(fm_pwm_wrap_handler)(void) {
 +    pwm_clear_irq(FM_PWM_SLICE);
@@ -251,7 +265,8 @@ index 0000000..af19129
 +    // the sample on 0 so the carrier sits exactly on fc instead of drifting
 +    // to whatever the last frame happened to be.
 +    uint16_t tail = s_ring_tail;
-+    if (tail != s_ring_head) {
++    bool empty = (tail == s_ring_head);
++    if (!empty) {
 +        s_cur_sample = s_ring[tail];
 +        s_ring_tail = (uint16_t)((tail + 1) & FM_RING_MASK);
 +    } else {
@@ -268,6 +283,26 @@ index 0000000..af19129
 +    // backlog builds up): this bypasses any DSP transient the RX path may
 +    // still be draining and silences the radio immediately.
 +    int32_t sample = s_mute ? 0 : s_cur_sample;
++    // Narrowband silence gate: broadcast FM parks the unmodulated carrier on
++    // fc (an FM radio outputs silence); narrowband mode keys the RF OFF so a
++    // handheld's squelch closes instead of hearing the off-tune parked CW as
++    // a continuous tone.  Keying back on as soon as audio flows again.
++    if (s_gate_silent) {
++        bool silent = s_mute || empty;
++        if (silent) {
++            if (!s_rf_gated && (s_empty_ticks >= FM_GATE_TICKS || s_mute)) {
++                pico_fractional_pll_enable_output(false);
++                s_rf_gated = true;
++            }
++            s_empty_ticks++;
++        } else {
++            s_empty_ticks = 0;
++            if (s_rf_gated) {
++                pico_fractional_pll_enable_output(true);
++                s_rf_gated = false;
++            }
++        }
++    }
 +    uint32_t freq = s_carrier_hz + (uint32_t)(((int64_t)sample * (int64_t)s_deviation_hz) >> 15);
 +    s_last_freq = freq;
 +    pico_fractional_pll_set_freq_u32(freq);
@@ -320,6 +355,9 @@ index 0000000..af19129
 +    s_dcb_yprev = 0;
 +    s_squelch_thr = 0;
 +    s_clips = 0;
++    s_gate_silent = false;
++    s_rf_gated = false;
++    s_empty_ticks = 0;
 +    s_last_freq = 0; // 0 until the 48kHz ISR has written at least once
 +    s_led_mode = 0;
 +    s_led_peak = 0;
@@ -364,10 +402,16 @@ index 0000000..af19129
 +
 +void fm_modulator_audio_stop(void) {
 +    fm_pwm_stop();
-+    // 'audio off' should silence the radio: park the PLL on the EXACT carrier
-+    // (no modulation -> a radio tuned to fc outputs silence).  This avoids an
-+    // off-tune CW, which can make the receiver's AGC/quieting cycle audibly.
-+    pico_fractional_pll_set_freq_u32(s_carrier_hz);
++    if (s_gate_silent) {
++        // Narrowband mode: key the output off - an unmodulated parked carrier
++        // would be an off-tune CW heard as a tone by a handheld radio.
++        pico_fractional_pll_enable_output(false);
++        s_rf_gated = true;
++    } else {
++        // 'audio off' should silence the radio: park the PLL on the EXACT
++        // carrier (no modulation -> a radio tuned to fc outputs silence).
++        pico_fractional_pll_set_freq_u32(s_carrier_hz);
++    }
 +    s_audio_route_on = false;
 +}
 +
@@ -497,13 +541,36 @@ index 0000000..af19129
 +    return s_preemphasis_enabled;
 +}
 +
-+// Select the pre-emphasis time constant (50 or 75 us).  The coefficient is
-+// applied on the next sample; the filter state is reset since it depends on
-+// the coefficient.
-+void fm_modulator_set_preemphasis_us(uint8_t us) {
++// Silence-gate mode for narrowband (handheld-radio) operation.  When enabled
++// the RF output is keyed off on silence (no stream / mute / audio off) and
++// keyed back on when audio flows; broadcast FM keeps the parked-carrier
++// behaviour (an FM radio outputs silence on an unmodulated fc carrier).
++void fm_modulator_set_silence_gate(bool gate) {
++    s_gate_silent = gate;
++    if (gate) {
++        s_empty_ticks = 0;
++    }
++}
++
++bool fm_modulator_silence_gate(void) {
++    return s_gate_silent;
++}
++
++// True while the RF output is keyed off waiting for audio (narrowband mode).
++bool fm_modulator_rf_gated(void) {
++    return s_rf_gated;
++}
++
++// Select the pre-emphasis time constant (50, 75 or 300 us).  The coefficient
++// is applied on the next sample; the filter state is reset since it depends
++// on the coefficient.  300us is the handheld-radio (voice) standard.
++void fm_modulator_set_preemphasis_us(uint16_t us) {
 +    if (us == 50) {
 +        s_lp75_a = FM_LP50_A_Q15;
 +        s_preemph_us = 50;
++    } else if (us == 300) {
++        s_lp75_a = FM_LP300_A_Q15;
++        s_preemph_us = 300;
 +    } else {
 +        s_lp75_a = FM_LP75_A_Q15;
 +        s_preemph_us = 75;
@@ -513,7 +580,7 @@ index 0000000..af19129
 +    s_lp15b = 0;
 +}
 +
-+uint8_t fm_modulator_get_preemphasis_us(void) {
++uint16_t fm_modulator_get_preemphasis_us(void) {
 +    return s_preemph_us;
 +}
 +
@@ -696,6 +763,25 @@ index 0000000..af19129
 +    // the flag would otherwise stay false while audio actually flows.
 +    s_audio_active = true;
 +
++    // Muted / routing-off fast path: drain the USB FIFO and drop the frames
++    // WITHOUT running the DSP / ring / LED code.  The digital activity of
++    // decoding and filtering live audio couples switching noise into the RF
++    // path on the same die, which pollutes a parked carrier (broadcast FM
++    // silence) - so while we are intentionally silent, do the minimum work.
++    // The 48kHz ISR already forces the sample to 0 while muted, so dropping
++    // the frames here changes nothing audibly (the ring simply drains).
++    if (s_mute || !s_audio_route_on) {
++        int16_t junk[32];
++        while (tud_audio_available() >= 4) {
++            uint16_t want = tud_audio_available();
++            if (want > sizeof(junk)) {
++                want = sizeof(junk);
++            }
++            tud_audio_read(junk, want);
++        }
++        return true;
++    }
++
 +    uint16_t volume = s_volume;
 +    bool mute = s_mute;
 +
@@ -856,10 +942,10 @@ index 0000000..af19129
 +#endif // MICROPY_HW_FM_TRANSMITTER
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.h b/ports/rp2/fm_transmitter/fm_modulator.h
 new file mode 100644
-index 0000000..198528f
+index 0000000..b69749d
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,132 @@
 +/*
 + * fm_modulator.h
 + *
@@ -927,8 +1013,15 @@ index 0000000..198528f
 +
 +// Select the pre-emphasis time constant (50 or 75 us).  Applies from the
 +// next sample; the default is 75 us (matches US/EU broadcast practice).
-+void fm_modulator_set_preemphasis_us(uint8_t us);
-+uint8_t fm_modulator_get_preemphasis_us(void);
++void fm_modulator_set_preemphasis_us(uint16_t us);
++uint16_t fm_modulator_get_preemphasis_us(void);
++
++// Narrowband silence handling: when `gate` is true the RF output is keyed off
++// on silence (no stream / mute / audio off) and keyed back on when audio
++// flows; when false (broadcast FM) the unmodulated carrier parks on fc.
++void fm_modulator_set_silence_gate(bool gate);
++bool fm_modulator_silence_gate(void);
++bool fm_modulator_rf_gated(void);
 +
 +// Weak-sample mute threshold in raw sample amplitude (0..32767).
 +// 0 disables it; samples below the threshold are zeroed in the RX path so
@@ -1033,10 +1126,10 @@ index 0000000..2f58f4a
 +target_link_libraries(usermod INTERFACE usermod_pico_fm)
 diff --git a/ports/rp2/fm_transmitter/modpico_fm.c b/ports/rp2/fm_transmitter/modpico_fm.c
 new file mode 100644
-index 0000000..5fb3ee5
+index 0000000..2db0405
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/modpico_fm.c
-@@ -0,0 +1,517 @@
+@@ -0,0 +1,545 @@
 +/*
 + * modpico_fm.c
 + *
@@ -1363,22 +1456,46 @@ index 0000000..5fb3ee5
 +}
 +static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_preemphasis_obj, mod_pico_fm_preemphasis);
 +
-+// pico_fm.set_preemphasis_tc(us) - pre-emphasis time constant (50 or 75 us)
++// pico_fm.set_preemphasis_tc(us) - pre-emphasis time constant (50, 75, 300 us)
 +static mp_obj_t mod_pico_fm_set_preemphasis_tc(mp_obj_t us_obj) {
 +    mp_int_t us = mp_obj_get_int(us_obj);
-+    if (us != 50 && us != 75) {
-+        mp_raise_ValueError(MP_ERROR_TEXT("pre-emphasis must be 50 or 75 us"));
++    if (us != 50 && us != 75 && us != 300) {
++        mp_raise_ValueError(MP_ERROR_TEXT("pre-emphasis must be 50, 75 or 300 us"));
 +    }
-+    fm_modulator_set_preemphasis_us((uint8_t)us);
++    fm_modulator_set_preemphasis_us((uint16_t)us);
 +    return mp_const_none;
 +}
 +static MP_DEFINE_CONST_FUN_OBJ_1(mod_pico_fm_set_preemphasis_tc_obj, mod_pico_fm_set_preemphasis_tc);
 +
-+// pico_fm.preemphasis_tc() -> 50 or 75
++// pico_fm.preemphasis_tc() -> 50, 75 or 300
 +static mp_obj_t mod_pico_fm_preemphasis_tc(void) {
 +    return mp_obj_new_int_from_uint(fm_modulator_get_preemphasis_us());
 +}
 +static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_preemphasis_tc_obj, mod_pico_fm_preemphasis_tc);
++
++// ---------------------------------------------------------------------------
++// pico_fm.set_silence_gate(bool) / silence_gate() / rf_gated()
++// ---------------------------------------------------------------------------
++// Narrowband silence handling: gate=true keys the RF output off on silence
++// (handheld radio squelch closes -> silence) instead of parking an
++// unmodulated carrier (which a handheld hears as an off-tune CW tone).
++// Broadcast FM keeps gate=false (park on fc -> FM radio silence).
++
++static mp_obj_t mod_pico_fm_set_silence_gate(mp_obj_t gate_obj) {
++    fm_modulator_set_silence_gate(mp_obj_is_true(gate_obj));
++    return mp_const_none;
++}
++static MP_DEFINE_CONST_FUN_OBJ_1(mod_pico_fm_set_silence_gate_obj, mod_pico_fm_set_silence_gate);
++
++static mp_obj_t mod_pico_fm_silence_gate(void) {
++    return mp_obj_new_bool(fm_modulator_silence_gate());
++}
++static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_silence_gate_obj, mod_pico_fm_silence_gate);
++
++static mp_obj_t mod_pico_fm_rf_gated(void) {
++    return mp_obj_new_bool(fm_modulator_rf_gated());
++}
++static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_rf_gated_obj, mod_pico_fm_rf_gated);
 +
 +// pico_fm.set_squelch(threshold) - weak-sample mute threshold 0..32767 (0 = off)
 +static mp_obj_t mod_pico_fm_set_squelch(mp_obj_t thr_obj) {
@@ -1514,6 +1631,10 @@ index 0000000..5fb3ee5
 +    { MP_ROM_QSTR(MP_QSTR_set_mute), MP_ROM_PTR(&mod_pico_fm_set_mute_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_preemphasis), MP_ROM_PTR(&mod_pico_fm_set_preemphasis_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_preemphasis_tc), MP_ROM_PTR(&mod_pico_fm_set_preemphasis_tc_obj) },
++    { MP_ROM_QSTR(MP_QSTR_preemphasis_tc), MP_ROM_PTR(&mod_pico_fm_preemphasis_tc_obj) },
++    { MP_ROM_QSTR(MP_QSTR_set_silence_gate), MP_ROM_PTR(&mod_pico_fm_set_silence_gate_obj) },
++    { MP_ROM_QSTR(MP_QSTR_silence_gate), MP_ROM_PTR(&mod_pico_fm_silence_gate_obj) },
++    { MP_ROM_QSTR(MP_QSTR_rf_gated), MP_ROM_PTR(&mod_pico_fm_rf_gated_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_refdiv), MP_ROM_PTR(&mod_pico_fm_set_refdiv_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_refdiv), MP_ROM_PTR(&mod_pico_fm_refdiv_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_pdm_rate), MP_ROM_PTR(&mod_pico_fm_set_pdm_rate_obj) },

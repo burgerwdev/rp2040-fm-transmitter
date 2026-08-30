@@ -65,6 +65,15 @@ All values are in Hz unless noted. Type `help` in the console anytime.
   refdiv 2 is neutral - keep the defaults unless experimenting.
   Use `tools/serial.sh` (tio auto-reconnect) so reboots do not kill your
   serial session.
+- **FM silence while the host keeps streaming**: `mute on` / `audio off`
+  park the unmodulated carrier on fc, but USB packet reception keeps running
+  and its on-die digital activity couples faint noise into the parked carrier
+  (audible only in the radio's quieting state; masked while music modulates
+  at 75kHz deviation).  This is inherent to the square-wave PDM transmitter
+  and was identical in the original firmware - the RX path drops the frames
+  (no DSP) but the USB hardware must still receive them.  For perfect FM
+  silence, pause the host playback (or `rf off`).  On narrowband bands the
+  silence gate avoids this entirely by keying the RF off.
 - **`sq` (weak-sample mute)**: samples below the threshold are zeroed in the
   RX path, so faint stream noise is not modulated. Note that pausing or
   muting already parks the carrier exactly on fc (no modulation), which makes

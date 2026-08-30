@@ -8,8 +8,9 @@ Turn a Raspberry Pi Pico (RP2040) into a **USB sound card + FM transmitter**:
 
 - Plugged into a PC it enumerates as a USB sound card (UAC1, 48kHz/16-bit/stereo);
   whatever the PC plays is streamed to the Pico over USB;
-- The audio is FM-modulated in real time onto **87.9 MHz** (configurable, up to
-  ~160 MHz) using the
+- The audio is FM-modulated in real time onto **87.9 MHz** (configurable:
+  broadcast FM 88-108M, 2m amateur 144-148M, and UHF 409/433/440M via the
+  3rd/5th harmonic of a <=150MHz fundamental) using the
   [pico-fractional-pll](https://github.com/kaduhi/pico-fractional-pll)
   technique, output on GPIO21;
 - MicroPython provides an interactive **`fm>` serial console**: carrier /
@@ -18,7 +19,9 @@ Turn a Raspberry Pi Pico (RP2040) into a **USB sound card + FM transmitter**:
 
 > **⚠️ LEGAL WARNING**: GPIO21 drives a strong RF square wave. **Do NOT attach
 > an antenna.** Unlicensed radiation is illegal in most countries. For testing,
-> put an FM radio within a few centimetres of the Pico.
+> put an FM radio within a few centimetres of the Pico.  On the UHF harmonic
+> bands the *fundamental* also radiates: for 409MHz it sits in the AERONAUTICAL
+> band (118-137MHz) - a band-pass filter is mandatory before radiating there.
 
 ---
 
@@ -38,6 +41,23 @@ Turn a Raspberry Pi Pico (RP2040) into a **USB sound card + FM transmitter**:
    `fm>` console appears automatically;
 4. On the PC select **"RP2040 RF Transmitter"** as the audio output and play;
 5. Tune an FM radio to **87.9 MHz**.
+
+One-command band presets (save + reboot):
+
+```
+band fm    -> 98.0 MHz FM broadcast (parked-carrier silence)
+band 2m    -> 145.0 MHz, handheld radio VHF WIDE mode
+band 433   -> 433.92 MHz on the 3rd harmonic (UHF WIDE mode)
+band 409   -> 409.75 MHz license-free PMR on the 3rd harmonic
+```
+
+For a handheld radio use **WIDE (25kHz)** mode and keep the deviation around
+12kHz; on UHF the console sets `refdiv 2` automatically (the half PDM step is
+what makes the harmonic links sound clean).  When there is no audio the
+narrowband bands key the RF output off (PTT-style) so the handheld squelch
+closes instead of hearing an off-tune parked carrier - use `silence park` to
+restore the broadcast behaviour.  For a serial session that survives reboots:
+`tools/serial.sh` (tio auto-reconnect; a udev rule pins `/dev/pico`).
 
 See [docs/en/usage.md](docs/en/usage.md) and
 [docs/en/commands.md](docs/en/commands.md).

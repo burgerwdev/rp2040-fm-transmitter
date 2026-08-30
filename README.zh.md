@@ -7,10 +7,10 @@
 把一片 Raspberry Pi Pico（RP2040）变成 **USB 声卡 + FM 发射器**：
 
 - 插上电脑即识别为 USB 声卡（UAC1，48kHz/16bit/立体声），电脑播放的声音经 USB 送入 Pico；
-- 声音通过 [pico-fractional-pll](https://github.com/kaduhi/pico-fractional-pll) 技术实时 FM 调制到 **87.9MHz**（可配置，最高约 160MHz），从 GPIO21 输出；
+- 声音通过 [pico-fractional-pll](https://github.com/kaduhi/pico-fractional-pll) 技术实时 FM 调制到 **87.9MHz**（可配置：广播 88-108M、2m 业余 144-148M、以及经 ≤150MHz 基频 3/5 次谐波输出的 UHF 409/433/440M），从 GPIO21 输出；
 - MicroPython 提供交互式 **`fm>` 串口控制台**：调载波/频偏/功率/预加重/音量，电平条显示，PLL 诊断等。
 
-> **⚠️ 法律警告**：GPIO21 输出强 RF 方波。**严禁接天线**。多数国家未经许可辐射即违法。测试时让 FM 收音机贴近 Pico（几厘米内）即可。
+> **⚠️ 法律警告**：GPIO21 输出强 RF 方波。**严禁接天线**。多数国家未经许可辐射即违法。测试时让 FM 收音机贴近 Pico（几厘米内）即可。UHF 谐波模式下**基频也会辐射**：409MHz 的基频在民航频段（118-137MHz）内——在 409 段发射前必须加带通滤波器抑制基频。
 
 ---
 
@@ -27,6 +27,21 @@
 3. 拔插（或按 RESET），等 2~3 秒，打开串口终端（115200）→ 自动进入 `fm>` 控制台；
 4. 电脑上把音频输出选为 **"RP2040 RF Transmitter"**，播放音乐；
 5. FM 收音机调到 **87.9MHz** 收听。
+
+一键频段预设（保存并重启）：
+
+```
+band fm    -> 98.0 MHz 广播 FM（载波停靠式静音）
+band 2m    -> 145.0 MHz，手台 VHF WIDE 模式
+band 433   -> 433.92 MHz（3 次谐波，UHF WIDE 模式）
+band 409   -> 409.75 MHz 免证公众对讲机（3 次谐波）
+```
+
+手台请用 **WIDE（25kHz）** 模式、频偏保持 12kHz 左右；UHF 段控制台自动设
+`refdiv 2`（PDM 步长减半是谐波链路音质干净的关键）。无声时窄带频段会把 RF
+输出键控关断（类 PTT），手台静噪闭合而不再听到失谐停靠载波的单音；需要恢复
+广播行为用 `silence park`。串口会话可用 `tools/serial.sh`（tio 自动重连；
+udev 规则把设备固定为 `/dev/pico`）。
 
 详细见 [docs/zh/usage.md](docs/zh/usage.md) 与 [docs/zh/commands.md](docs/zh/commands.md)。
 

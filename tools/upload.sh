@@ -58,7 +58,11 @@ def drain(sec):
     end = time.time() + sec
     out = b""
     while time.time() < end:
-        b = s.read(512)
+        try:
+            b = s.read(512)
+        except Exception:
+            time.sleep(0.1)
+            continue
         if b:
             out += b
     return out
