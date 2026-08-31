@@ -1,4 +1,4 @@
-# RP2040 Pico FM 发射器（RP2040 Pico FM Transmitter）
+# RP2040 FM 发射器（RP2040 FM Transmitter）
 
 **版本 v0.23.1** —— MicroPython USB 声卡 + FM 发射器
 
