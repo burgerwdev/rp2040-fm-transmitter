@@ -24,7 +24,7 @@ VERSION = "0.23.1"          # console release version (see release README)
 
 # SHA-256 of the firmware this console is shipped with
 # (release/firmware/rp2040pico_fm_firmware.uf2).  Shown by `ver`.
-FW_SHA256 = "9f0f5e0fa9c2ffac0eda97cf6731dbc694b2a693a326ab1ae7781fd864fc0869"
+FW_SHA256 = "2ea6b3a988b341a0aef6ebb7d105c93596e31587c7d1695ab83925b85b50b56b"
 
 # Project links shown by the `ver` command.
 PROJECT_URL = "https://git.sr.ht/~bytewolf/rp2040-fm-transmitter"

@@ -16,7 +16,7 @@ index ee6f1b8..9d2768c 100644
  if(MICROPY_USER_FROZEN_MANIFEST)
 diff --git a/ports/rp2/boards/RPI_PICO_FM/board.json b/ports/rp2/boards/RPI_PICO_FM/board.json
 new file mode 100644
-index 0000000..c39d5e0
+index 0000000..75ba3ba
 --- /dev/null
 +++ b/ports/rp2/boards/RPI_PICO_FM/board.json
 @@ -0,0 +1,21 @@
@@ -36,7 +36,7 @@ index 0000000..c39d5e0
 +        "rp2-pico.jpg"
 +    ],
 +    "mcu": "rp2040",
-+    "product": "Pico FM Transmitter",
++    "product": "RP2040 FM Transmitter",
 +    "thumbnail": "",
 +    "url": "https://www.raspberrypi.com/products/raspberry-pi-pico/",
 +    "vendor": "Raspberry Pi"
@@ -58,12 +58,12 @@ index 0000000..d310696
 +set(MICROPY_HW_FM_TRANSMITTER 1)
 diff --git a/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.h b/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.h
 new file mode 100644
-index 0000000..c5e882d
+index 0000000..e422a98
 --- /dev/null
 +++ b/ports/rp2/boards/RPI_PICO_FM/mpconfigboard.h
 @@ -0,0 +1,20 @@
 +// Board and hardware specific configuration
-+#define MICROPY_HW_BOARD_NAME                   "Raspberry Pi Pico FM"
++#define MICROPY_HW_BOARD_NAME                   "RP2040 FM Transmitter"
 +
 +// Enable the FM transmitter firmware:
 +//  - boots with clk_sys = 48MHz from PLL_USB (leaving PLL_SYS free for RF)
@@ -77,7 +77,7 @@ index 0000000..c5e882d
 +// so reusing it for a CDC+Audio composite makes Windows fail to load drivers
 +// (yellow exclamation marks).  Use a distinct PID instead.
 +#define MICROPY_HW_USB_VID                      (0x1209) // pid.codes (prototype)
-+#define MICROPY_HW_USB_PID                      (0xFA50) // Pico FM Transmitter
++#define MICROPY_HW_USB_PID                      (0xFA50) // RP2040 FM Transmitter
 +
 +// USB strings shown in the OS (Device Manager / dmesg).
 +#define MICROPY_HW_USB_MANUFACTURER_STRING      "BurgerW"
@@ -2477,7 +2477,7 @@ index f6b1fe9..75d5a45 100644
                  break;
          }
 diff --git a/shared/tinyusb/tusb_config.h b/shared/tinyusb/tusb_config.h
-index 5432b9c..c956761 100644
+index 5432b9c..a99f627 100644
 --- a/shared/tinyusb/tusb_config.h
 +++ b/shared/tinyusb/tusb_config.h
 @@ -47,6 +47,14 @@
@@ -2489,7 +2489,7 @@ index 5432b9c..c956761 100644
 +#endif
 +
 +#ifndef MICROPY_HW_USB_AUDIO_INTERFACE_STRING
-+#define MICROPY_HW_USB_AUDIO_INTERFACE_STRING "Pico FM Sound Card"
++#define MICROPY_HW_USB_AUDIO_INTERFACE_STRING "RP2040 Sound Card"
 +#endif
 +
  #ifndef MICROPY_HW_USB_MSC_INQUIRY_VENDOR_STRING
