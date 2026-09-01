@@ -118,10 +118,10 @@ index 0000000..16e3340
 +LED,GPIO25
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.c b/ports/rp2/fm_transmitter/fm_modulator.c
 new file mode 100644
-index 0000000..5ebd45b
+index 0000000..28b6077
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.c
-@@ -0,0 +1,818 @@
+@@ -0,0 +1,871 @@
 +/*
 + * fm_modulator.c
 + *
@@ -197,9 +197,12 @@ index 0000000..5ebd45b
 +static int32_t s_lp15;                  // first 15 kHz band-limit LP state
 +static int32_t s_lp75;                  // pre-emphasis LP state (2.1/3.2 kHz)
 +static int32_t s_lp75_a;                // pre-emphasis coefficient (Q15)
-+static int32_t s_lp15b;                 // second 15 kHz LP (limited pre-emphasis)
++static int32_t s_lp15b;                 // second band-limit LP (limited pre-emphasis)
 +static int32_t s_dcb_xprev;             // DC blocker (2 Hz high-pass) state
 +static int32_t s_dcb_yprev;
++static int32_t s_hp_xprev;              // NFM 300 Hz high-pass state
++static int32_t s_hp_yprev;
++static volatile bool s_nfm_audio;       // narrowband voice-band chain (300Hz HP + 3kHz LP)
 +static volatile uint16_t s_squelch_thr; // weak-sample mute threshold (0 = off)
 +static volatile uint32_t s_clips;       // limiter clip counter (since boot)
 +
@@ -233,6 +236,8 @@ index 0000000..5ebd45b
 +// ---------------------------------------------------------------------------
 +
 +#define FM_LP15_A_Q15   (28168)  // a = 1 - exp(-2*pi*15000/48000)  (15kHz LP)
++#define FM_LP3K_A_Q15   (10644)  // a = 1 - exp(-2*pi*3000/48000)   (3kHz LP)
++#define FM_HP300_A_Q15  (31509)  // a = exp(-2*pi*300/48000)        (300Hz HP)
 +#define FM_LP75_A_Q15   (7953)   // a = 1 - exp(-1/(75us*48000))    (2.1kHz LP)
 +#define FM_LP50_A_Q15   (11169)  // a = 1 - exp(-1/(50us*48000))    (3.2kHz LP)
 +#define FM_LP300_A_Q15  (2199)   // a = 1 - exp(-1/(300us*48000))   (530Hz LP)
@@ -353,6 +358,9 @@ index 0000000..5ebd45b
 +    s_lp15b = 0;
 +    s_dcb_xprev = 0;
 +    s_dcb_yprev = 0;
++    s_hp_xprev = 0;
++    s_hp_yprev = 0;
++    s_nfm_audio = false;
 +    s_squelch_thr = 0;
 +    s_clips = 0;
 +    s_gate_silent = false;
@@ -457,6 +465,12 @@ index 0000000..5ebd45b
 +
 +// Process one mono sample: returns the sample to transmit.
 +static int16_t fm_audio_process(int16_t x) {
++    // Narrowband voice-band low-pass coefficient: on narrowband (handheld
++    // radio) bands the audio is limited to ~3kHz instead of 15kHz, matching
++    // the channel and the receiver's audio band (deviation is not wasted on
++    // content the radio filters out anyway).
++    int32_t lp_a = s_nfm_audio ? FM_LP3K_A_Q15 : FM_LP15_A_Q15;
++
 +    // DC blocker (2 Hz one-pole high-pass): removes any DC offset in the
 +    // incoming stream so the average frequency stays exactly on the carrier.
 +    int32_t dcb = s_dcb_yprev + (x - s_dcb_xprev) - ((s_dcb_yprev * FM_DCB_A_Q15) >> 15);
@@ -468,6 +482,20 @@ index 0000000..5ebd45b
 +        dcb = -32768;
 +    }
 +    x = (int16_t)dcb;
++
++    // NFM 300 Hz high-pass: strips hum/rumble below the voice band so they do
++    // not eat deviation budget.  One-pole: y = a*(y_prev + x - x_prev).
++    if (s_nfm_audio) {
++        int32_t hp = (int32_t)(((int64_t)FM_HP300_A_Q15 * ((int32_t)x + s_hp_yprev - s_hp_xprev)) >> 15);
++        s_hp_xprev = x;
++        s_hp_yprev = hp;
++        if (hp > 32767) {
++            hp = 32767;
++        } else if (hp < -32768) {
++            hp = -32768;
++        }
++        x = (int16_t)hp;
++    }
 +
 +    // sq <threshold>: zero weak samples (below the threshold) so faint
 +    // background noise in the stream is not modulated; the carrier then
@@ -481,11 +509,17 @@ index 0000000..5ebd45b
 +    }
 +
 +    if (!s_preemphasis_enabled) {
++        if (s_nfm_audio) {
++            // The channel low-pass still applies without pre-emphasis.
++            int32_t lp = s_lp15 + ((lp_a * (int32_t)(x - s_lp15)) >> 15);
++            s_lp15 = lp;
++            x = (int16_t)lp;
++        }
 +        return x;
 +    }
 +
-+    // 15 kHz band-limit low-pass (one-pole).
-+    int32_t lp15 = s_lp15 + ((FM_LP15_A_Q15 * (int32_t)(x - s_lp15)) >> 15);
++    // Band-limit low-pass (15kHz broadcast / 3kHz narrowband).
++    int32_t lp15 = s_lp15 + ((lp_a * (int32_t)(x - s_lp15)) >> 15);
 +    s_lp15 = lp15;
 +
 +    // 50/75 us pre-emphasis: high-pass component scaled and added back.
@@ -503,9 +537,9 @@ index 0000000..5ebd45b
 +        y = -32768;
 +    }
 +
-+    // Limited pre-emphasis: re-apply the 15 kHz low-pass so the boosted
++    // Limited pre-emphasis: re-apply the band-limit low-pass so the boosted
 +    // high-frequency noise does not hammer the limiter.
-+    int32_t lp15b = s_lp15b + ((FM_LP15_A_Q15 * (y - s_lp15b)) >> 15);
++    int32_t lp15b = s_lp15b + ((lp_a * (y - s_lp15b)) >> 15);
 +    s_lp15b = lp15b;
 +    y = lp15b;
 +
@@ -559,6 +593,25 @@ index 0000000..5ebd45b
 +// True while the RF output is keyed off waiting for audio (narrowband mode).
 +bool fm_modulator_rf_gated(void) {
 +    return s_rf_gated;
++}
++
++// Narrowband voice-band chain: when enabled the audio passes a 300 Hz
++// high-pass and a 3 kHz low-pass (matching the handheld-radio channel and
++// its audio band, so deviation is not wasted on out-of-band content).
++// Broadcast FM keeps the 15 kHz band-limit.  Filter states are reset on
++// toggle (the coefficients change).
++void fm_modulator_set_nfm_audio(bool nfm) {
++    if (s_nfm_audio != nfm) {
++        s_hp_xprev = 0;
++        s_hp_yprev = 0;
++        s_lp15 = 0;
++        s_lp15b = 0;
++    }
++    s_nfm_audio = nfm;
++}
++
++bool fm_modulator_nfm_audio(void) {
++    return s_nfm_audio;
 +}
 +
 +// Select the pre-emphasis time constant (50, 75 or 300 us).  The coefficient
@@ -942,10 +995,10 @@ index 0000000..5ebd45b
 +#endif // MICROPY_HW_FM_TRANSMITTER
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.h b/ports/rp2/fm_transmitter/fm_modulator.h
 new file mode 100644
-index 0000000..b69749d
+index 0000000..21178f9
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.h
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,137 @@
 +/*
 + * fm_modulator.h
 + *
@@ -1022,6 +1075,11 @@ index 0000000..b69749d
 +void fm_modulator_set_silence_gate(bool gate);
 +bool fm_modulator_silence_gate(void);
 +bool fm_modulator_rf_gated(void);
++
++// Narrowband voice-band chain: 300 Hz high-pass + 3 kHz low-pass (handheld
++// radio bands).  Broadcast FM keeps the 15 kHz band-limit.
++void fm_modulator_set_nfm_audio(bool nfm);
++bool fm_modulator_nfm_audio(void);
 +
 +// Weak-sample mute threshold in raw sample amplitude (0..32767).
 +// 0 disables it; samples below the threshold are zeroed in the RX path so
@@ -1126,10 +1184,10 @@ index 0000000..2f58f4a
 +target_link_libraries(usermod INTERFACE usermod_pico_fm)
 diff --git a/ports/rp2/fm_transmitter/modpico_fm.c b/ports/rp2/fm_transmitter/modpico_fm.c
 new file mode 100644
-index 0000000..2db0405
+index 0000000..e2a04bc
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/modpico_fm.c
-@@ -0,0 +1,545 @@
+@@ -0,0 +1,562 @@
 +/*
 + * modpico_fm.c
 + *
@@ -1497,6 +1555,21 @@ index 0000000..2db0405
 +}
 +static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_rf_gated_obj, mod_pico_fm_rf_gated);
 +
++// pico_fm.set_nfm_audio(bool) / nfm_audio() - narrowband voice-band chain
++// (300 Hz high-pass + 3 kHz low-pass).  Broadcast FM keeps the 15 kHz
++// band-limit.  The console resolves this automatically from the band.
++
++static mp_obj_t mod_pico_fm_set_nfm_audio(mp_obj_t nfm_obj) {
++    fm_modulator_set_nfm_audio(mp_obj_is_true(nfm_obj));
++    return mp_const_none;
++}
++static MP_DEFINE_CONST_FUN_OBJ_1(mod_pico_fm_set_nfm_audio_obj, mod_pico_fm_set_nfm_audio);
++
++static mp_obj_t mod_pico_fm_nfm_audio(void) {
++    return mp_obj_new_bool(fm_modulator_nfm_audio());
++}
++static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_nfm_audio_obj, mod_pico_fm_nfm_audio);
++
 +// pico_fm.set_squelch(threshold) - weak-sample mute threshold 0..32767 (0 = off)
 +static mp_obj_t mod_pico_fm_set_squelch(mp_obj_t thr_obj) {
 +    mp_int_t thr = mp_obj_get_int(thr_obj);
@@ -1635,6 +1708,8 @@ index 0000000..2db0405
 +    { MP_ROM_QSTR(MP_QSTR_set_silence_gate), MP_ROM_PTR(&mod_pico_fm_set_silence_gate_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_silence_gate), MP_ROM_PTR(&mod_pico_fm_silence_gate_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_rf_gated), MP_ROM_PTR(&mod_pico_fm_rf_gated_obj) },
++    { MP_ROM_QSTR(MP_QSTR_set_nfm_audio), MP_ROM_PTR(&mod_pico_fm_set_nfm_audio_obj) },
++    { MP_ROM_QSTR(MP_QSTR_nfm_audio), MP_ROM_PTR(&mod_pico_fm_nfm_audio_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_refdiv), MP_ROM_PTR(&mod_pico_fm_set_refdiv_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_refdiv), MP_ROM_PTR(&mod_pico_fm_refdiv_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_set_pdm_rate), MP_ROM_PTR(&mod_pico_fm_set_pdm_rate_obj) },

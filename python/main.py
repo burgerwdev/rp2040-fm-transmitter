@@ -24,7 +24,7 @@ VERSION = "0.23.1"          # console release version (see release README)
 
 # SHA-256 of the firmware this console is shipped with
 # (release/firmware/rp2040pico_fm_firmware.uf2).  Shown by `ver`.
-FW_SHA256 = "2ea6b3a988b341a0aef6ebb7d105c93596e31587c7d1695ab83925b85b50b56b"
+FW_SHA256 = "679c2c64d6a7bcbe68567daa820bfde9682c32cf4a61a46bcb986a262af883d1"
 
 # Project links shown by the `ver` command.
 PROJECT_URL = "https://git.sr.ht/~bytewolf/rp2040-fm-transmitter"
@@ -75,6 +75,9 @@ SQUELCH_PCT = DEFAULT_SQUELCH
 HARMONIC = 1
 TARGET_FREQ = DEFAULT_CARRIER
 DEV_EFF = DEFAULT_DEVIATION
+# Fine frequency trim (effective Hz, what the radio sees).  Compensates the
+# crystal tolerance, which the harmonic multiplies (x3 on UHF: ~+5-8kHz).
+TRIM_HZ = 0
 
 # Silence handling.  Broadcast FM (87.5-108MHz) parks the unmodulated carrier
 # on fc so an FM radio outputs silence; narrowband bands (2m/UHF, handheld
@@ -133,7 +136,10 @@ RP2040 RF Transmitter console - commands (values in Hz unless stated):
   reinit <car> <dev> [pin]   save band/deviation/RF pin, then reboot
                        (UHF 409/433/440M targets are converted to the
                        fundamental x harmonic automatically)
-  band <fm|2m|409|433>  one-command band preset (sets refdiv + silence gate)
+  band <fm|2m|409|433|446>  one-command band preset (sets refdiv + silence
+                       gate + NFM audio)
+  trim <±Hz>           fine frequency trim (effective; compensates the
+                       crystal offset; applies immediately)
   silence <auto|park|gate>  silent-state behaviour: auto = FM parks the
                        carrier, narrowband keys RF off (handheld squelch)
   pre on|off|50|75|300  15kHz band-limit + pre-emphasis + limiter
@@ -261,14 +267,24 @@ pre on|off|50|75|300 - 15kHz band-limit + pre-emphasis + soft limiter.
   high-frequency hiss.  Saved to %s.
   Example: pre 300""" % CFG_FILE,
     "band": """\
-band <fm|2m|409|433> - one-command band preset (saves and reboots).
-  fm   98.0 MHz   FM broadcast (parked-carrier silence)
-  2m   145.0 MHz  2m amateur (refdiv 1, WIDE mode, RF gated when silent)
-  409  409.75 MHz PRC license-free PMR on the 3rd harmonic (refdiv 2, gate)
-  433  433.92 MHz ISM/ham on the 3rd harmonic (refdiv 2, gate)
-  Sets the carrier/deviation, the PLL reference divider and the silence mode
+band <fm|2m|409|433|446> - one-command band preset (saves and reboots).
+  fm   98.0 MHz    FM broadcast (parked-carrier silence, 15kHz audio)
+  2m   145.0 MHz   2m amateur (refdiv 1, WIDE mode, RF gated when silent)
+  409  409.75 MHz  PRC license-free PMR on the 3rd harmonic (refdiv 2, gate)
+  433  433.92 MHz  ISM/ham on the 3rd harmonic (refdiv 2, gate)
+  446  446.00625 MHz  PMR446 ch1 on the 3rd harmonic (refdiv 2, gate, 2.5kHz)
+  Sets the carrier/deviation, the PLL reference divider, the silence mode and
+  the NFM voice-band audio (300Hz HP + 3kHz LP on non-broadcast bands)
   automatically.  Custom bands: use `reinit`.
   Example: band 433""",
+    "trim": """\
+trim <±Hz> - fine frequency trim, effective at the radio.
+  The crystal tolerance (+-20-30ppm) is multiplied by the harmonic on UHF
+  bands (x3: +-6-9kHz), so the emission lands a few kHz off the nominal
+  channel.  A trim shifts the fundamental to compensate: e.g. if the 433.92M
+  preset measures 433.925M on the radio -> `trim -5000` centres it.
+  Applies immediately (no reboot) and is saved to config.  `trim 0` disables.
+  Example: trim -5000""",
     "silence": """\
 silence <auto|park|gate> - what to radiate when there is no audio.
   park - leave the unmodulated carrier on fc (broadcast FM: an FM radio
@@ -395,6 +411,7 @@ def save_current(carrier=None, deviation=None, rf_pin=None, pdm_rate=None, refdi
         "target_freq": TARGET_FREQ,
         "harmonic": HARMONIC,
         "dev_eff": DEV_EFF,
+        "trim_hz": TRIM_HZ,
         "rf_pin": rf_pin if rf_pin is not None else RF_PIN,
         "power_ma": pico_fm.power(),
         "led_pin": "ws2812" if LED_WS2812 else pico_fm.led_pin(),
@@ -439,6 +456,9 @@ def apply_runtime_cfg(cfg, start_ws2812=False):
         pico_fm.set_silence_gate(silence_gate_resolve(TARGET_FREQ))
     else:
         pico_fm.set_silence_gate(smode == "gate")
+    # NFM voice-band chain (300Hz HP + 3kHz LP) on the same non-broadcast
+    # bands as the gate; broadcast FM keeps the 15kHz audio band.
+    pico_fm.set_nfm_audio(silence_gate_resolve(TARGET_FREQ))
     pico_fm.set_squelch(SQUELCH_PCT * 32767 // 100)
     led_pin = cfg.get("led_pin", 25)
     if led_pin == "ws2812":
@@ -569,6 +589,11 @@ def show_status():
               % (" - gated now" if gated_now else ""))
     else:
         print("Silence        : park (unmodulated carrier on fc)")
+    print("Audio band     : %s" % ("voice (300Hz HP, 3kHz LP)" if pico_fm.nfm_audio()
+                                  else "broadcast (15kHz LP)"))
+    if TRIM_HZ:
+        print("Trim           : %+d Hz effective (%+d Hz fundamental)"
+              % (TRIM_HZ, round(TRIM_HZ / HARMONIC)))
     print("Clips          : %d (since boot)" % pico_fm.clips())
     print("RF power       : %d mA" % pico_fm.power())
     print("PDM dither     : %d MHz (PLL refdiv %d)" % (pico_fm.pdm_rate(), pico_fm.refdiv()))
@@ -676,7 +701,7 @@ def vbar():
 
 
 def do_command(line):
-    global RF_ON, AUDIO_ON, PREEMPH, SQUELCH_PCT, HARMONIC, TARGET_FREQ, DEV_EFF, SILENCE_MODE
+    global RF_ON, AUDIO_ON, PREEMPH, SQUELCH_PCT, HARMONIC, TARGET_FREQ, DEV_EFF, SILENCE_MODE, TRIM_HZ
     parts = line.split()
     if not parts:
         return True
@@ -720,7 +745,7 @@ def do_command(line):
                     else:
                         h = HARMONIC if HARMONIC > 1 else \
                             (pick_harmonic(v) if v > HARMONIC_CEILING else 1)
-                        fund = fundamental_of(v, h)
+                        fund = fundamental_of(v, h) + round(TRIM_HZ / h)
                         if h == HARMONIC and lo <= fund <= hi:
                             pico_fm.set_carrier(fund)
                             TARGET_FREQ = v
@@ -806,11 +831,12 @@ def do_command(line):
                 "2m":  (145_000_000, 12_000),    # 2m amateur, WIDE mode
                 "409": (409_750_000, 12_500),    # PRC license-free PMR, 3rd harm.
                 "433": (433_920_000, 12_500),    # 433.92 ISM/ham, 3rd harmonic
+                "446": (446_006_250, 2_500),     # PMR446 ch1 (EU), 3rd harmonic
             }
             if arg is None or arg.lower() not in BANDS:
-                print("usage: band <fm|2m|409|433>")
+                print("usage: band <fm|2m|409|433|446>")
                 for k, (f, d) in BANDS.items():
-                    print("  %-4s -> %.3f MHz / %.1f kHz%s" % (
+                    print("  %-4s -> %.4f MHz / %.1f kHz%s" % (
                         k, f / 1e6, d / 1e3,
                         " (3rd harmonic)" if f > HARMONIC_CEILING else ""))
             else:
@@ -842,6 +868,26 @@ def do_command(line):
                 save_current()
                 print("silence mode: %s (RF %s when silent)"
                       % (arg, "off" if gate else "parked on fc"))
+        elif cmd == "trim":
+            if arg is None:
+                print("usage: trim <±Hz>  (fine frequency trim, effective at the radio; 0 = off)")
+                print("  Compensates the crystal tolerance, which the harmonic")
+                print("  multiplies (x3 on UHF: e.g. trim -5000 centres a 433.925M")
+                print("  emission on 433.920M).  Applies immediately; saved.")
+            else:
+                v = parse_int(arg, "trim")
+                if v is not None:
+                    old = TRIM_HZ
+                    TRIM_HZ = v
+                    fund = fundamental_of(TARGET_FREQ, HARMONIC) + round(TRIM_HZ / HARMONIC)
+                    if lo <= fund <= hi:
+                        pico_fm.set_carrier(fund)
+                        save_current()
+                        print("trim %+d Hz effective (%+d Hz fundamental), carrier live"
+                              % (TRIM_HZ, round(TRIM_HZ / HARMONIC)))
+                    else:
+                        TRIM_HZ = old
+                        print("error: trimmed carrier outside the PLL band - trim unchanged")
         elif cmd == "pin":
             if arg is None or arg not in ("21", "23", "24", "25"):
                 print("usage: pin <21|23|24|25>  (RF output GPIO; saves and reboots)")
@@ -1075,7 +1121,7 @@ def do_setup():
     the banner.  Runs inside the retry loop so an interrupt during setup
     restarts it instead of dropping to the plain REPL."""
     global RF_PIN, LED_WS2812, WS2812_PIN, PREEMPH, SQUELCH_PCT
-    global HARMONIC, TARGET_FREQ, DEV_EFF
+    global HARMONIC, TARGET_FREQ, DEV_EFF, TRIM_HZ
     cfg = load_cfg()
     rf_pin = cfg_int(cfg, "rf_pin", RF_PIN)
     if rf_pin not in (21, 23, 24, 25):
@@ -1089,10 +1135,11 @@ def do_setup():
     if harmonic not in (1, 3, 5, 7):
         harmonic = 1
     target_freq = cfg_int(cfg, "target_freq", 0)
+    TRIM_HZ = cfg_int(cfg, "trim_hz", 0)
     if target_freq:
         HARMONIC = harmonic
         TARGET_FREQ = target_freq
-        carrier = fundamental_of(target_freq, harmonic)
+        carrier = fundamental_of(target_freq, harmonic) + round(TRIM_HZ / harmonic)
         dev_eff = cfg_int(cfg, "dev_eff", 0)
         if dev_eff:
             DEV_EFF = dev_eff
@@ -1102,8 +1149,8 @@ def do_setup():
             DEV_EFF = deviation * harmonic
     else:
         HARMONIC = 1
-        carrier = cfg_int(cfg, "carrier", DEFAULT_CARRIER)
-        TARGET_FREQ = carrier
+        carrier = cfg_int(cfg, "carrier", DEFAULT_CARRIER) + round(TRIM_HZ / harmonic)
+        TARGET_FREQ = carrier - round(TRIM_HZ / harmonic)
         deviation = cfg_int(cfg, "deviation", DEFAULT_DEVIATION)
         DEV_EFF = deviation
 

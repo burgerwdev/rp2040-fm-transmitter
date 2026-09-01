@@ -89,11 +89,18 @@ mkdir -p "${OUT_DIR}"
 cp micropython/ports/rp2/build-RPI_PICO_FM/firmware.uf2 \
     "${OUT_DIR}/rp2040pico_fm_firmware.uf2"
 VERSION="$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null || echo unknown)"
+FW_HASH="$(sha256sum "${OUT_DIR}/rp2040pico_fm_firmware.uf2" | awk '{print $1}')"
 {
-    echo "# RP2040 Pico FM Transmitter - v${VERSION}"
+    echo "# RP2040 FM Transmitter - v${VERSION}"
     echo "# Prebuilt firmware for MicroPython v1.29.0 (patch micropython-fm.patch)."
-    sha256sum rp2040pico_fm_firmware.uf2
+    echo "# Verify from the repo root:  sha256sum -c firmware/sha256.txt"
+    echo "${FW_HASH}  firmware/rp2040pico_fm_firmware.uf2"
 } > "${OUT_DIR}/sha256.txt"
+
+# 6. Keep the console's FW_SHA256 in sync with the built firmware (the
+#    console displays it via `ver` so a mismatch is instantly visible).
+sed -i "s/^FW_SHA256 = \".*\"/FW_SHA256 = \"${FW_HASH}\"/" "${SCRIPT_DIR}/python/main.py"
+echo "==> main.py FW_SHA256 synced: ${FW_HASH}"
 
 echo
 echo "==> Done: ${OUT_DIR}/rp2040pico_fm_firmware.uf2"
