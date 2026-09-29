@@ -20,11 +20,11 @@ import time
 
 import pico_fm
 
-VERSION = "0.23.1"          # console release version (see release README)
+VERSION = "0.24.0"          # console release version (see release README)
 
 # SHA-256 of the firmware this console is shipped with
 # (release/firmware/rp2040pico_fm_firmware.uf2).  Shown by `ver`.
-FW_SHA256 = "679c2c64d6a7bcbe68567daa820bfde9682c32cf4a61a46bcb986a262af883d1"
+FW_SHA256 = "810e9e0bd8599ef11051de81aa9a65a28e35ca4b39bf30caf9983b11f6018ebb"
 
 # Project links shown by the `ver` command.
 PROJECT_URL = "https://git.sr.ht/~bytewolf/rp2040-fm-transmitter"

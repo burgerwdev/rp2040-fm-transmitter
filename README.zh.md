@@ -1,6 +1,6 @@
 # RP2040 FM 发射器（RP2040 FM Transmitter）
 
-**版本 v0.23.1** —— MicroPython USB 声卡 + FM 发射器
+**版本 v0.24.0** —— MicroPython USB 声卡 + FM 发射器
 
 中文 · [English](README.md) · [项目主页](https://git.sr.ht/~bytewolf/rp2040-fm-transmitter)
 
@@ -61,18 +61,27 @@ release/
 ├── python/
 │   └── main.py                # FM 控制台脚本（复制到板子）
 ├── tools/
-│   └── flash.sh               # picotool 烧录辅助
+│   ├── flash.sh               # picotool 烧录辅助
+│   ├── upload.sh              # 上传 python/main.py（自动退回控制台）
+│   ├── serial.sh              # 串口终端（自动重连）
+│   ├── pico_port.sh           # 解析开发板的 USB CDC 端口
+│   ├── pll_range.py           # PLL 可达范围 / PDM 步进枚举
+│   ├── audio_quality.py       # 主机端音频链定点模型
+│   ├── design_filters.py      # Chebyshev 设计与 Q15 验证
+│   └── make_test_audio.py     # 测试信号生成
 └── docs/
     ├── README.md              # 文档索引（中英双语）
     ├── en/                    # English docs
     │   ├── usage.md
     │   ├── commands.md
     │   ├── technical.md
+    │   ├── audio-quality.md
     │   └── troubleshooting.md
     └── zh/                    # 中文文档
         ├── usage.md           # 使用说明
         ├── commands.md        # 指令使用指南
         ├── technical.md       # 技术文档
+        ├── audio-quality.md   # 音质分层审计
         └── troubleshooting.md # 故障排查
 ```
 

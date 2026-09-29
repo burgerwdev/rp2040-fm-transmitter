@@ -535,7 +535,9 @@ range (at −60 dB, i.e. already 60 dB of attenuation).
 
 ---
 
-## 7. Regression verification (compile only, nothing flashed)
+## 7. Regression verification
+
+**Build (`./build.sh`, clean clone)**
 
 ```
 $ ./build.sh
@@ -550,16 +552,29 @@ $ ./build.sh
 
 - `./build.sh` completed end-to-end on a **clean clone** (clone → apply patch →
   `make submodules` → build); the resulting UF2 has sha256
-  `810e9e0bd8599ef11051de81aa9a65a28e35ca4b39bf30caf9983b11f6018ebb`.
+  `810e9e0bd8599ef11051de81aa9a65a28e35ca4b39bf30caf9983b11f6018ebb`, and that
+  is what `firmware/rp2040pico_fm_firmware.uf2` holds (`sha256sum -c
+  firmware/sha256.txt` passes and `python/main.py`'s `FW_SHA256` matches).
 - **Patch round-trip**: regenerating the patch after applying
   `patches/micropython-fm.patch` to a clean MicroPython gives **0 diff** against
   the committed patch, i.e. the patch is self-consistent and reproduces this
   build exactly.
-- **Nothing was flashed and the board was not rebooted.** The tracked
-  `firmware/*.uf2` and `firmware/sha256.txt` are still the v0.23.1 release
-  artifacts (sha `679c2c64…`) and `python/main.py`'s `FW_SHA256` matches them:
-  this branch has not been verified on hardware, so an untested binary is not
-  shipped as the prebuilt firmware (run `./build.sh` for this branch's build).
+
+**Hardware validation (v0.24.0, 98.0 MHz FM broadcast, host streaming)**
+
+| Item | Measured | Cross-check |
+|---|---|---|
+| `ver` | sha `810e9e0b…` | matches the shipped firmware |
+| `status` | `PLL range 97.500..98.250 MHz`, `step 750.0 kHz`, `refdiv 1` | matches `pll_range.py check 98000000 75000 1 -> div=16` bit for bit |
+| `diag 30` | ISR +1440230, RX +1440192, Underflows +39, Drops 0 | two independent estimates: 27.1 ppm from the event count, 26.4 ppm from the counter difference; predicted event rate 1.28/s vs 1.3/s measured |
+| `Clips` | 0 | the reworked pre-emphasis leaves ample headroom |
+
+The host 48 kHz clock is ~27 ppm slower than the on-board PWM clock, so the
+ring is starved and the number of dropped samples equals the event count (no
+hidden loss). On the old firmware this is **1.3 full-scale steps per second
+(clicks)**; this version turns each into a repeated sample (~20 µs,
+inaudible) - the one item of this change that simulation could not settle.
+
 - **Doc-number consistency**: all 72 values quoted in this document were found
   in the corresponding script output (`audio_quality.py resp/compare/drift/`
   `mono/volume`, `pll_range.py bands/check/minstep`); no documented number is

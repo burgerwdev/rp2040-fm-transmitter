@@ -484,7 +484,9 @@ $ python3 tools/pll_range.py minstep 80000000 500000000 500000 5000 --refdiv 2
 
 ---
 
-## 7. 回归验证（编译，不刷写）
+## 7. 回归验证
+
+**编译（`./build.sh`，干净克隆）**
 
 ```
 $ ./build.sh
@@ -499,14 +501,28 @@ $ ./build.sh
 
 - `./build.sh` 在**干净克隆**上全流程成功（克隆 → 打补丁 → `make submodules`
   → 编译），产出 UF2 的 sha256 为
-  `810e9e0bd8599ef11051de81aa9a65a28e35ca4b39bf30caf9983b11f6018ebb`。
-- **补丁往返校验**：在干净 MicroPython 上应用 `patches/micropython-fm.patch`
-  后重新生成的补丁与仓库中的补丁 **0 差异**，说明补丁自洽且能精确复现该构建。
-- **没有刷写、没有重启开发板。** 仓库中已跟踪的 `firmware/*.uf2` 与
-  `firmware/sha256.txt` 仍是 v0.23.1 的发布产物
-  （sha `679c2c64…`），`python/main.py` 的 `FW_SHA256` 与其一致：本分支的
-  代码尚未在硬件上验证，因此不用未经测试的二进制替换预编译固件（需要本
-  分支固件请自行 `./build.sh`）。
+  `810e9e0bd8599ef11051de81aa9a65a28e35ca4b39bf30caf9983b11f6018ebb`；
+  仓库中的 `firmware/rp2040pico_fm_firmware.uf2` 就是它
+  （`sha256sum -c firmware/sha256.txt` 通过，`python/main.py` 的 `FW_SHA256`
+  与其一致）。
+- **补丁往返校验**：在干净 MicroPython 上应用
+  `patches/micropython-fm.patch` 后重新生成的补丁与仓库中的补丁 **0 差异**，
+  说明补丁自洽且能精确复现该构建。
+
+**硬件验证（v0.24.0，98.0 MHz FM 广播，主机播放中）**
+
+| 项 | 实测 | 对照 |
+|---|---|---|
+| `ver` | sha `810e9e0b…` | 与仓库固件一致 |
+| `status` | `PLL range 97.500..98.250 MHz`、`step 750.0 kHz`、`refdiv 1` | 与 `pll_range.py check 98000000 75000 1 → div=16` 逐位一致 |
+| `diag 30` | ISR +1440230、RX +1440192、Underflows +39、Drops 0 | 两个独立估计：事件率 27.1 ppm、计数差 26.4 ppm；理论事件率 1.28/s，实测 1.3/s |
+| `Clips` | 0 | 预加重改造后余量充足 |
+
+即：主机 48 kHz 时钟比板载 PWM 时钟慢约 27 ppm，环缓冲被抽干、
+丢样数 = 计数数（无隐藏丢样）。旧固件在此条件下是 **1.3 次/秒的满度阶跃
+（咔嗒）**，本版本变成 1 个采样重复（约 20 µs，不可闻）——
+这是本次改动中靠仿真无法证明的那一项。
+
 - **文档数字一致性**：本文件引用的 72 个数值全部在对应脚本输出中找到
   （`audio_quality.py resp/compare/drift/mono/volume`、
   `pll_range.py bands/check/minstep`）；未发现只存在于文档而不可复现的数字。

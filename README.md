@@ -1,6 +1,6 @@
 # RP2040 FM Transmitter
 
-**Version 0.23.1** — MicroPython USB sound card + FM transmitter
+**Version 0.24.0** — MicroPython USB sound card + FM transmitter
 
 [中文](README.zh.md) · English · [Project](https://git.sr.ht/~bytewolf/rp2040-fm-transmitter)
 
@@ -79,18 +79,27 @@ release/
 ├── python/
 │   └── main.py                # console script (copy to the board)
 ├── tools/
-│   └── flash.sh               # picotool helper
+│   ├── flash.sh               # picotool helper
+│   ├── upload.sh              # upload python/main.py (console-aware)
+│   ├── serial.sh              # serial terminal (auto-reconnect)
+│   ├── pico_port.sh           # resolve the board's USB CDC port
+│   ├── pll_range.py           # PLL range / PDM-step enumeration
+│   ├── audio_quality.py       # host-side fixed-point audio-chain model
+│   ├── design_filters.py      # Chebyshev design + Q15 verification
+│   └── make_test_audio.py     # test signal generator
 └── docs/
     ├── README.md              # documentation index (both languages)
     ├── en/                    # English docs
     │   ├── usage.md           # usage guide
     │   ├── commands.md        # console command reference
     │   ├── technical.md       # technical architecture
+    │   ├── audio-quality.md   # audio-quality layer audit
     │   └── troubleshooting.md # troubleshooting
     └── zh/                    # 中文文档
         ├── usage.md           # 使用说明
         ├── commands.md        # 指令使用指南
         ├── technical.md       # 技术文档
+        ├── audio-quality.md   # 音质分层审计
         └── troubleshooting.md # 故障排查
 ```
 
