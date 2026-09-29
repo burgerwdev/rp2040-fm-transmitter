@@ -118,10 +118,10 @@ index 0000000..16e3340
 +LED,GPIO25
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.c b/ports/rp2/fm_transmitter/fm_modulator.c
 new file mode 100644
-index 0000000..98ed877
+index 0000000..e258f52
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.c
-@@ -0,0 +1,941 @@
+@@ -0,0 +1,971 @@
 +/*
 + * fm_modulator.c
 + *
@@ -964,27 +964,57 @@ index 0000000..98ed877
 +#define FM_VOL_MAX      (0)
 +#define FM_VOL_RES      (0x0100)
 +
++// -0..-60 dB as a linear gain: round(32767 * 10^(dB/20)), one entry per dB.
++// The old code mapped dB *linearly* to the gain, so requesting -30 dB produced
++// -6 dB (a +24 dB error) and the slider had only ~10 dB of usable range.
++static const uint16_t fm_vol_table[61] = {
++    32767, 29204, 26028, 23197, 20675, 18426, 16422, 14636,
++    13045, 11626, 10362,  9235,  8231,  7336,  6538,  5827,
++     5193,  4628,  4125,  3677,  3277,  2920,  2603,  2320,
++     2067,  1843,  1642,  1464,  1304,  1163,  1036,   923,
++      823,   734,   654,   583,   519,   463,   413,   368,
++      328,   292,   260,   232,   207,   184,   164,   146,
++      130,   116,   104,    92,    82,    73,    65,    58,
++       52,    46,    41,    37,    33,
++};
++
 +// Convert a UAC1 volume (signed 16-bit, 1/256 dB units) to a linear gain.
-+// Range is mapped linearly from -60dB..0dB to 0..32767.
++// db256 is 0..-15360 (0 dB .. -60 dB); the magnitude is split into whole dB
++// and the 1/256 dB remainder, then interpolated in the table (worst error
++// < 0.02 dB; the old linear mapping was off by +24 dB at -30 dB).
 +static uint16_t fm_db256_to_gain(int16_t db256) {
-+    int32_t clamped = db256;
-+    if (clamped < FM_VOL_MIN) {
-+        clamped = FM_VOL_MIN;
++    int32_t mag = -(int32_t)db256;
++    if (mag < 0) {
++        mag = 0;
 +    }
-+    if (clamped > FM_VOL_MAX) {
-+        clamped = FM_VOL_MAX;
++    if (mag > -FM_VOL_MIN) {
++        mag = -FM_VOL_MIN;
 +    }
-+    return (uint16_t)(((clamped - FM_VOL_MIN) * 32767) / (FM_VOL_MAX - FM_VOL_MIN));
++    uint32_t i = (uint32_t)mag >> 8;
++    uint32_t f = (uint32_t)mag & 0xFF;
++    if (i >= 60) {
++        return fm_vol_table[60];
++    }
++    int32_t step = (int32_t)fm_vol_table[i + 1] - (int32_t)fm_vol_table[i];
++    return (uint16_t)((int32_t)fm_vol_table[i] + ((step * (int32_t)f) >> 8));
 +}
 +
 +// Convert a linear gain (0..32767) to a UAC1 volume (1/256 dB units).
++// Inverse of fm_db256_to_gain() by searching the (monotonic) table.
 +static int16_t fm_gain_to_db256(uint16_t gain) {
 +    int32_t g = gain;
 +    if (g > 32767) {
 +        g = 32767;
 +    }
-+    // Inverse of fm_db256_to_gain().
-+    return (int16_t)(FM_VOL_MIN + (g * (FM_VOL_MAX - FM_VOL_MIN)) / 32767);
++    for (int i = 0; i < 60; i++) {
++        if (g >= (int32_t)fm_vol_table[i + 1]) {
++            int32_t span = (int32_t)fm_vol_table[i] - (int32_t)fm_vol_table[i + 1];
++            int32_t off = (int32_t)fm_vol_table[i] - g;
++            int32_t frac = (span > 0) ? ((off << 8) / span) : 0;
++            return (int16_t)(-((i << 8) + frac));
++        }
++    }
++    return (int16_t)FM_VOL_MIN;
 +}
 +
 +// Answer a GET_* control request with a single value.

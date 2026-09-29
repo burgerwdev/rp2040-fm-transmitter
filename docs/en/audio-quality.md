@@ -159,11 +159,14 @@ $ python3 tools/pll_range.py check 7074000 3000 2
 ... div=200 ... PDM step=30.000 kHz
 ```
 
-`refdiv 2` halves the step on **every** band, but `main.py` currently sets
-`refdiv 2` only for targets above 150 MHz (UHF harmonics). Note that the
-host cannot compute the **residual** ripple after loop filtering (that needs the
+`refdiv 2` halves the step on **every** band, but `main.py` only set
+`refdiv 2` for targets above 150 MHz (UHF harmonics). Note that the host
+cannot compute the **residual** ripple after loop filtering (that needs the
 loop bandwidth and a phase-noise measurement), so only the computable step is
 given here; the residual is left to hardware measurement.
+
+→ **fixed by change 5 (§4)**: replaced by a data-driven rule plus the new
+`refdiv auto`.
 
 ### L2 ring-buffer observability (P2, fixed by change 4 in §4)
 
@@ -199,9 +202,11 @@ so `gain_lin = (db + 60) / 60` and the actual attenuation is
 
 i.e. only the top ~10 dB of the volume slider is accurate.
 
+→ **fixed by change 6 (§4)**.
+
 The other defaults (`DEFAULT_PREEMPH="on"(75us)`, `DEFAULT_SQUELCH=0`,
-`DEFAULT_CARRIER=87.9 MHz`) are reasonable in themselves; the problem is the
-`refdiv` choice rule in the `band` presets (see L5).
+`DEFAULT_CARRIER=87.9 MHz`) are reasonable in themselves; the `refdiv` choice
+rule is covered in L5.
 
 ### L4 modulation mapping (negligible)
 
@@ -401,6 +406,67 @@ Note: the counters only make the drift *visible*, they do not correct it;
 hold-last removes the click, not the timing error. A real fix is an ASRC or a
 UAC1 feedback endpoint (see the upgrade path below).
 
+### Change 5: refdiv policy and console defaults (L5)
+
+- new `refdiv_for(target)`: **1 where the carrier is parked, 2 everywhere
+  else.**  Broadcast FM (87.5–108 MHz) parks the unmodulated carrier when
+  silent, and refdiv 2 changes the parked PDM pattern and puts an audible idle
+  tone on the silent carrier (hardware-observed: the v0.22.x FM silence
+  regression), so it must stay 1. 2m/UHF/narrowband-HF key the RF off when
+  silent, so there is no parked carrier and they take 2.
+- `band_apply()`, the `band` command and boot-time `apply_config()` all use the
+  helper now (they used to test `target > 150 MHz` only); the console gained
+  `refdiv <1|2|auto>` with auto as the default, and an explicit 1/2 in the
+  config still wins.
+- if the refdiv-2 window is unsolvable at boot, init automatically falls back
+  to refdiv 1 (a failed `init` never launches core1, so the retry is safe) and
+  persists the 1.
+- `status` now shows the actual PDM step (the width of the window
+  `pico_fm.range()` returns is exactly one feedback-divider step).
+
+```
+$ python3 tools/pll_range.py minstep 1800000 30000000 50000 3000 --refdiv 2
+  windows with a solution: 559, without: 6
+  first-found is NOT the minimum step in 0 window(s)
+$ python3 tools/pll_range.py minstep 80000000 500000000 500000 5000 --refdiv 2
+  windows with a solution: 129, without: 712
+  first-found is NOT the minimum step in 0 window(s)
+```
+
+The solution the C `calculate_pll_divider()` returns already has the smallest
+step within its pass, so the search needs no change (verification instead of
+speculation).
+
+| Band | step before | step after |
+|---|---|---|
+| FM 98.0 MHz (parked) | 750 kHz (refdiv 1) | 750 kHz (stays 1, avoids the idle tone) |
+| 2m 145.0 MHz | 1.2 MHz (refdiv 1) | **600 kHz** (refdiv 2) |
+| 433.92 MHz (x3) | 600 kHz (refdiv 2) | 600 kHz (unchanged) |
+| 30m 10.136 MHz | 80 kHz (refdiv 1) | **40 kHz** (refdiv 2) |
+| 20m 14.074 MHz | 120 kHz | **60 kHz** |
+| 10m 28.074 MHz | 240 kHz | **120 kHz** |
+
+### Change 6: real dB mapping for the UAC1 volume (L6)
+
+- new `fm_vol_table[61]` (one `round(32767*10^(dB/20))` per dB from 0 to
+  -60 dB); `fm_db256_to_gain()` interpolates between whole dB and the
+  1/256 dB remainder, and `fm_gain_to_db256()` searches the monotonic table
+  (exact round trip).
+- only the two fixed-point helpers change; neither is on the ISR path and
+  there is no floating point.
+
+| requested (dB) | actual before | error before | actual after | error after |
+|---|---|---|---|---|
+| −6 | −0.92 | +5.08 | −6.00 | −0.00 |
+| −12 | −1.94 | +10.06 | −12.00 | +0.00 |
+| −20 | −3.52 | +16.48 | −20.00 | +0.00 |
+| −30 | −6.02 | +23.98 | −30.00 | −0.00 |
+| −40 | −9.54 | +30.46 | −39.99 | +0.01 |
+| −60 | −∞ | — | −59.94 | +0.06 |
+
+Worst interpolation error: 0.015 dB over 0…−30 dB, 0.26 dB over the whole
+range (at −60 dB, i.e. already 60 dB of attenuation).
+
 ### Before/after (`audio_quality.py compare`)
 
 | Metric | Before | After |
@@ -416,14 +482,18 @@ UAC1 feedback endpoint (see the upgrade path below).
 | worst step on an underflow | 27591 | **7053** |
 | THD during underflows | 0.035 % | **0.008 %** |
 | drop/underflow observability | no counters | `pico_fm.ring_stats()` |
+| 2m PDM dither step | 1.2 MHz | **600 kHz** |
+| 30m PDM dither step | 80 kHz | **40 kHz** |
+| refdiv selection | `target > 150 MHz` only | **`refdiv_for()` + `refdiv auto`** |
+| actual attenuation for a −30 dB request | −6.0 dB (error +24 dB) | **−30.0 dB (error 0)** |
 
 ## 5. Remaining work
 
 | Item | Status |
 |---|---|
 | L1/L2: hold-last + drop/underflow counters | **done (change 4)**; residual: no ASRC / feedback endpoint, so the drift still exists |
-| L5: default `refdiv 2` on every band | task-4 |
-| L6: real dB mapping for the UAC1 volume | task-4 |
+| L5: refdiv policy + `refdiv auto` | **done (change 5)**; residual: the **residual** ripple after loop filtering still needs hardware measurement |
+| L6: real dB mapping for the UAC1 volume | **done (change 6)** (worst interpolation error 0.26 dB, 0.015 dB over 0…−30 dB) |
 | limiter look-ahead | not implemented (gain is programme-dependent; change 1 already removed the main pseudo-distortion source) |
 | ASRC / UAC1 feedback endpoint | not implemented (needs ISR budget or TinyUSB feedback support; a structural change) |
 

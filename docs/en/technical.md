@@ -90,9 +90,55 @@ links sound cleaner than the 2m fundamental at refdiv 1.
   it with a band-pass filter for any sustained use.  433MHz's fundamental is
   in the 2m amateur band.
 
-### 4. Diagnostics
+### PLL reference divider (refdiv) policy
 
-- `diag`: ISR ticks and RX frames over 1 s (both should be ~48000/s);
+The instantaneous frequency hops between two adjacent feedback-divider values
+on the 1 MHz PDM tick with `step = ref/div`; that step is the hard floor of
+the residual RF ripple.  `refdiv 2` lowers the reference from 12 MHz to
+6 MHz and **halves the step on every band** (`tools/pll_range.py bands`):
+
+| Band | Frequency | step at refdiv 1 | step at refdiv 2 |
+|---|---|---|---|
+| 160m | 1.840 MHz | unreachable | **7 kHz** |
+| 80m | 3.573 MHz | unreachable | **16 kHz** |
+| 40m | 7.074 MHz | 80 kHz | **30 kHz** |
+| 30m | 10.136 MHz | 80 kHz | **40 kHz** |
+| 20m | 14.074 MHz | 120 kHz | **60 kHz** |
+| 10m | 28.074 MHz | 240 kHz | **120 kHz** |
+| 2m | 145.000 MHz | 1.2 MHz | **600 kHz** |
+| 433.92 MHz (x3) | 144.640 MHz | 1.2 MHz | **600 kHz** |
+| FM broadcast | 87.900 MHz | 750 kHz | 375 kHz (but see below) |
+
+**refdiv 2 must not be used where the carrier is parked, though.**  Broadcast
+FM (87.5–108 MHz) parks the unmodulated carrier on fc when silent; with
+refdiv 2 the parked PDM pattern changes and puts an audible idle tone on the
+silent carrier (hardware-observed, the v0.22.x FM silence regression).  The
+rule is therefore:
+
+```
+refdiv_for(target) = 2 if (the band keys the RF off when silent) else 1
+```
+
+ie broadcast FM takes 1; everything else (2m, UHF harmonics, narrowband HF)
+takes 2.  The console gained `refdiv <1|2|auto>` (default auto); an explicit
+1/2 already in the config wins.  Because refdiv 2 narrows the reachable PLL
+window, boot-time `init` failures fall back to refdiv 1 automatically (a
+failed `init` never launches core1, so the retry is safe - unlike the
+"deinit/init while running deadlocks" case) and the 1 is persisted so the
+probe does not repeat on every boot.
+
+`status` now shows the actual step (the width of the window `pico_fm.range()`
+returns is exactly one feedback-divider step).  In addition,
+`tools/pll_range.py minstep` verifies that the solution the C
+`calculate_pll_divider()` returns **already has the smallest step within its
+pass** (559 HF windows + 129 UHF windows, 0 counterexamples), so the PLL
+search itself needs no change.
+
+### 5. Diagnostics
+
+- `diag`: ISR ticks, RX frames, and the ring drift counters (underflow = host
+  clock slower, repeats the last sample on an empty ring; drop = host clock
+  faster, ring full);
 - `pwm`: clk_sys, PWM registers, ISR cost (2–6 µs is normal);
 - `pll`: PLL ready / actual output range / last written frequency;
 - `ring`: ring fill % (near 0% when balanced; 99% means the consumer stalled).

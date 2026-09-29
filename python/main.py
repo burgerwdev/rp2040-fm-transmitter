@@ -94,6 +94,23 @@ def silence_gate_resolve(target):
     return not (87_500_000 <= target <= 108_000_000)
 
 
+def refdiv_for(target):
+    """PLL reference divider for a band: 2 unless the carrier is parked.
+
+    refdiv 2 halves the PDM dither step (ref/div, the instantaneous frequency
+    jump between the two feedback-divider values) on every band; that step is
+    what sets the residual frequency ripple a narrowband receiver hears.  It
+    must NOT be used where the *unmodulated* carrier is parked for silence
+    (broadcast FM 87.5-108 MHz): the parked PDM pattern changes and puts an
+    audible idle tone on the silent carrier (hardware-observed).  Bands that
+    key the RF off when silent have no parked carrier, so they take refdiv 2.
+
+    Evidence: tools/pll_range.py (see docs/*/audio-quality.md).  Half the
+    step, e.g. 87.9 MHz 750 kHz -> 375 kHz, 145 MHz 1.2 MHz -> 600 kHz.
+    """
+    return 2 if silence_gate_resolve(target) else 1
+
+
 def pll_limits():
     """(lo, hi) actual PLL output range in Hz, and max sensible deviation."""
     lo, hi = pico_fm.range()
@@ -118,6 +135,24 @@ def fundamental_of(target, harmonic):
 def dev_fund_of(dev_eff, harmonic):
     """Fundamental full-scale deviation (Hz) for an effective deviation."""
     return max(1, round(dev_eff / harmonic))
+
+
+def pll_step_str():
+    """The PDM dither step (ref/div) as a short string, for `status`.
+
+    pico_fm.range() returns the window the divider search accepted, which is
+    exactly one feedback-divider step wide (freq_delta = ref/div).  That width
+    is the instantaneous frequency jump the core1 PDM loop produces - the
+    hard limit behind the residual RF ripple.  Fundamental value; a harmonic
+    band multiplies it by the harmonic at the radio.
+    """
+    lo, hi = pico_fm.range()
+    d = hi - lo
+    if d >= 1_000_000:
+        return "%.2f MHz" % (d / 1e6)
+    if d >= 1_000:
+        return "%.1f kHz" % (d / 1e3)
+    return "%d Hz" % d
 
 
 def ring_stats():
@@ -158,7 +193,7 @@ RP2040 RF Transmitter console - commands (values in Hz unless stated):
   pre on|off|50|75|300  15kHz band-limit + pre-emphasis + limiter
                        (300us = handheld-radio standard)
   pdm <1|2|3|4>        PDM dither rate in MHz (1 = default; saves, reboots)
-  refdiv <1|2>         PLL reference divider (saves, reboots)
+  refdiv <1|2|auto>    PLL reference divider (saves, reboots)
   pin <21|23|24|25>    change RF output GPIO (saves and reboots)
   pwr <2|4|8|12>       RF output drive strength in mA (12 = max, default)
   rf on|off            RF output on/off
@@ -233,12 +268,15 @@ pdm <1|2|3|4> - PDM dither rate in MHz (experimental).
   and reboots (a live PLL re-init without reboot deadlocks the board).
   Example: pdm 1""" % CFG_FILE,
     "refdiv": """\
-refdiv <1|2> - PLL reference divider (experimental).
-  REFDIV=2 halves the feedback-divider step (12MHz -> 6MHz per fbdiv LSB).
-  Hardware testing found it neutral (no audible change) - kept for
-  experimentation.  Default 1.  Saves to %s and reboots (a live PLL re-init
-  without reboot deadlocks the board).
-  Example: refdiv 1""" % CFG_FILE,
+refdiv <1|2|auto> - PLL reference divider.  Default auto.
+  REFDIV=2 halves the feedback-divider step (12MHz -> 6MHz per fbdiv LSB)
+  and therefore the residual frequency ripple a narrowband receiver hears;
+  it also narrows the reachable PLL window.  'auto' picks 2 for every band
+  that gates the RF off when silent, and 1 where the unmodulated carrier is
+  parked for silence (broadcast FM 87.5-108 MHz), because a parked carrier
+  with refdiv 2 has an audible idle tone (hardware-observed).
+  Saves to %s and reboots (a live PLL re-init without reboot deadlocks the
+  board).  Example: refdiv auto""" % CFG_FILE,
     "pin": """\
 pin <21|23|24|25> - change the RF output GPIO, save and reboot.
   RF can ONLY go to 21/23/24/25: the RP2040 clock-output mux (clk_gpout0-3)
@@ -282,7 +320,7 @@ pre on|off|50|75|300 - 15kHz band-limit + pre-emphasis + soft limiter.
     "band": """\
 band <fm|2m|409|433|446> - one-command band preset (saves and reboots).
   fm   98.0 MHz    FM broadcast (parked-carrier silence, 15kHz audio)
-  2m   145.0 MHz   2m amateur (refdiv 1, WIDE mode, RF gated when silent)
+  2m   145.0 MHz   2m amateur (refdiv 2, WIDE mode, RF gated when silent)
   409  409.75 MHz  PRC license-free PMR on the 3rd harmonic (refdiv 2, gate)
   433  433.92 MHz  ISM/ham on the 3rd harmonic (refdiv 2, gate)
   446  446.00625 MHz  PMR446 ch1 on the 3rd harmonic (refdiv 2, gate, 2.5kHz)
@@ -503,12 +541,12 @@ def band_apply(target, dev_eff, pin):
     TARGET_FREQ = target
     DEV_EFF = dev_eff
     HARMONIC = 1 if target <= HARMONIC_CEILING else pick_harmonic(target)
-    # Band-appropriate PLL reference divider: refdiv 1 for broadcast FM / 2m
-    # (the proven-clean parked-carrier behaviour), refdiv 2 for UHF harmonic
-    # links (half PDM step).  A leftover refdiv 2 on FM changes the parked
-    # PDM pattern and puts an audible idle tone on the silent carrier - this
-    # is what broke the FM pause-silence after a previous UHF session.
-    pico_fm.set_refdiv(2 if target > HARMONIC_CEILING else 1)
+    # Band-appropriate PLL reference divider (see refdiv_for()): refdiv 2
+    # halves the PDM dither step, but must stay 1 where the unmodulated
+    # carrier is parked for silence - a leftover refdiv 2 on FM changes the
+    # parked PDM pattern and puts an audible idle tone on the silent carrier
+    # (this is what broke the FM pause-silence after a previous UHF session).
+    pico_fm.set_refdiv(refdiv_for(target))
     SILENCE_MODE = "auto"   # band-derived: FM parks the carrier, NFM gates it
     save_current(rf_pin=pin)
     if HARMONIC > 1:
@@ -617,7 +655,8 @@ def show_status():
               % (TRIM_HZ, round(TRIM_HZ / HARMONIC)))
     print("Clips          : %d (since boot)" % pico_fm.clips())
     print("RF power       : %d mA" % pico_fm.power())
-    print("PDM dither     : %d MHz (PLL refdiv %d)" % (pico_fm.pdm_rate(), pico_fm.refdiv()))
+    print("PDM dither     : %d MHz (PLL refdiv %d, step %s)"
+          % (pico_fm.pdm_rate(), pico_fm.refdiv(), pll_step_str()))
     print("LED           : %s, mode %d (0=off 1=always 2=stream 3=VU)"
           % ("WS2812 GPIO%d" % WS2812_PIN if LED_WS2812
              else "GPIO%d" % pico_fm.led_pin(), pico_fm.led_mode()))
@@ -836,14 +875,21 @@ def do_command(line):
                 time.sleep_ms(100)
                 machine.reset()
         elif cmd == "refdiv":
-            if arg is None or arg not in ("1", "2"):
-                print("usage: refdiv <1|2>  (PLL reference divider; 1 = default)")
-                print("  Hardware testing found it neutral - keep 1 unless experimenting.")
+            if arg is None or arg not in ("1", "2", "auto"):
+                print("usage: refdiv <1|2|auto>")
+                print("  PLL reference divider.  2 halves the PDM dither step")
+                print("  (ref/div) on every band, which is what sets the residual")
+                print("  frequency ripple a narrowband receiver hears; it also")
+                print("  narrows the reachable PLL window.  'auto' (default) picks")
+                print("  2 unless the band parks the unmodulated carrier for")
+                print("  silence (broadcast FM), where refdiv 2 puts an audible")
+                print("  idle tone on the silent carrier.")
                 print("  Saves and reboots to apply.")
             else:
-                pico_fm.set_refdiv(int(arg))
+                v = refdiv_for(TARGET_FREQ) if arg == "auto" else int(arg)
+                pico_fm.set_refdiv(v)
                 save_current()
-                print("REFDIV set to %s - rebooting..." % arg)
+                print("REFDIV set to %d (%s) - rebooting..." % (v, arg))
                 time.sleep_ms(100)
                 machine.reset()
         elif cmd == "band":
@@ -862,8 +908,9 @@ def do_command(line):
                         " (3rd harmonic)" if f > HARMONIC_CEILING else ""))
             else:
                 target, dev = BANDS[arg.lower()]
-                # The verified UHF recipe uses refdiv 2 (half PDM step).
-                pico_fm.set_refdiv(2 if target > HARMONIC_CEILING else 1)
+                # The UHF harmonic recipe and every gated (non-parked) band use
+                # refdiv 2: half the PDM step.  See refdiv_for().
+                pico_fm.set_refdiv(refdiv_for(target))
                 h = pick_harmonic(target)
                 fund = fundamental_of(target, h)
                 if h > 1 and 118_000_000 <= fund <= 137_000_000:
@@ -1193,9 +1240,9 @@ def do_setup():
     # read once at PLL/core1 launch): REFDIV=2 halves the PDM step, and a
     # faster PDM dither is averaged more strongly by the PLL loop filter -
     # both lower the residual ripple heard by narrowband (12.5/25kHz) radios.
-    refdiv = cfg_int(cfg, "refdiv", 1)
+    refdiv = cfg_int(cfg, "refdiv", 0)
     if refdiv not in (1, 2):
-        refdiv = 1
+        refdiv = refdiv_for(TARGET_FREQ)   # unset / invalid -> auto
     pico_fm.set_refdiv(refdiv)
     pdm_rate = cfg_int(cfg, "pdm_rate", 1)
     if not (1 <= pdm_rate <= 4):
@@ -1206,22 +1253,39 @@ def do_setup():
     try:
         pico_fm.init(carrier, deviation, RF_PIN)
         ok = True
-    except ValueError as e:
-        print("ERROR: init with saved config failed: %s" % e)
-        print("Falling back to defaults %.3f MHz / %.1f kHz"
-              % (DEFAULT_CARRIER / 1e6, DEFAULT_DEVIATION / 1e3))
-        try:
-            os.remove(CFG_FILE)
-        except OSError:
-            pass
-        HARMONIC = 1
-        TARGET_FREQ = DEFAULT_CARRIER
-        DEV_EFF = DEFAULT_DEVIATION
-        try:
-            pico_fm.init(DEFAULT_CARRIER, DEFAULT_DEVIATION, RF_PIN)
-            ok = True
-        except ValueError as e:
-            print("ERROR: default config also failed: %s" % e)
+    except ValueError as exc:
+        # refdiv 2 halves the PDM step but narrows the reachable PLL window;
+        # a window that only fits with refdiv 1 is still perfectly valid.  A
+        # failed init() never launches core1, so retrying is safe (unlike a
+        # deinit/init on a running PLL).
+        if refdiv == 2:
+            print("NOTE: %s" % exc)
+            print("Retrying with refdiv 1 (wider PLL window, larger PDM step)")
+            refdiv = 1
+            pico_fm.set_refdiv(1)
+            try:
+                pico_fm.init(carrier, deviation, RF_PIN)
+                ok = True
+                save_current(refdiv=1)   # do not repeat the probe every boot
+            except ValueError as exc2:
+                exc = exc2
+        if not ok:
+            print("ERROR: init with saved config failed: %s" % exc)
+            print("Falling back to defaults %.3f MHz / %.1f kHz"
+                  % (DEFAULT_CARRIER / 1e6, DEFAULT_DEVIATION / 1e3))
+            try:
+                os.remove(CFG_FILE)
+            except OSError:
+                pass
+            HARMONIC = 1
+            TARGET_FREQ = DEFAULT_CARRIER
+            DEV_EFF = DEFAULT_DEVIATION
+            pico_fm.set_refdiv(refdiv_for(DEFAULT_CARRIER))
+            try:
+                pico_fm.init(DEFAULT_CARRIER, DEFAULT_DEVIATION, RF_PIN)
+                ok = True
+            except ValueError as exc2:
+                print("ERROR: default config also failed: %s" % exc2)
     if ok:
         pico_fm.enable_output(True)
         pico_fm.audio(True)

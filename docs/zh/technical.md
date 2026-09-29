@@ -83,9 +83,48 @@ target/3，手台收 target（频偏同样 ×3）。REFDIV=2 把基频 PDM 步�
   比 409MHz 信号更强——任何持续使用都必须加带通滤波器抑制基频。433MHz
   的基频在 2m 业余段，无此问题。
 
-### 4. 诊断
+### PLL 参考分频器（refdiv）选择策略
 
-- `diag`：1 秒内 ISR 触发数与 RX 入队帧数，正常都应 ~48000/s；
+瞬时频率在 1 MHz 的 PDM 节拍上以 `step = ref/div` 在相邻两个反馈分频值
+之间跳跃，这就是射频残余抖动的硬下限。`refdiv 2` 把参考从 12 MHz 降到
+6 MHz，在**每个**频段把 `step` 减半（见 `tools/pll_range.py bands`）：
+
+| 频段 | 频率 | refdiv 1 的 step | refdiv 2 的 step |
+|---|---|---|---|
+| 160m | 1.840 MHz | 不可达 | **7 kHz** |
+| 80m | 3.573 MHz | 不可达 | **16 kHz** |
+| 40m | 7.074 MHz | 80 kHz | **30 kHz** |
+| 30m | 10.136 MHz | 80 kHz | **40 kHz** |
+| 20m | 14.074 MHz | 120 kHz | **60 kHz** |
+| 10m | 28.074 MHz | 240 kHz | **120 kHz** |
+| 2m | 145.000 MHz | 1.2 MHz | **600 kHz** |
+| 433.92 MHz（×3） | 144.640 MHz | 1.2 MHz | **600 kHz** |
+| FM 广播 | 87.900 MHz | 750 kHz | 375 kHz（但见下） |
+
+**但是 refdiv 2 不能用在载波需要“停波”的频段。** 广播 FM（87.5–108 MHz）
+在静音时把未调制载波停在 fc，此时 PDM 图案会改变并在静音载波上产生可听
+的嗡声（硬件实测，见 v0.22.x 的 FM 静音回归）。所以规则是：
+
+```
+refdiv_for(target) = 2 if (该频段静音时关断射频) else 1
+```
+
+即广播 FM 用 1，其余（2m、UHF 谐波、短波窄带）用 2。控制台新增
+`refdiv <1|2|auto>`（默认 auto）；配置里已有显式的 1/2 时以配置为准。
+refdiv 2 会把可达 PLL 窗口变窄，因此启动时如果 `init` 失败会自动回退到
+refdiv 1（失败的 `init` 不会启动 core1，所以重试是安全的——这与「运行中
+deinit/init 会死锁」是两回事），并把 1 写回配置避免每次开机重试。
+
+`status` 现在会显示实际的 step（`pico_fm.range()` 返回的窗口宽度就是
+一个反馈分频步）。另外 `tools/pll_range.py minstep` 验证了 C 的
+`calculate_pll_divider()` 取到的解**已经是同 pass 内 step 最小的解**
+（HF 559 个窗口 + UHF 129 个窗口，0 个反例），所以无需修改 PLL 搜索。
+
+### 5. 诊断
+
+- `diag`：1 秒内 ISR 触发数、RX 入队帧数，以及环形缓冲漂移计数
+  （underflow = 主机时钟偏慢、空环时重复上一采样；drop = 主机时钟偏快、
+  环满丢弃）；
 - `pwm`：clk_sys、PWM 寄存器、ISR 单次耗时（2~6µs 正常）；
 - `pll`：PLL ready / 实际输出范围 / 最后一次写入频率；
 - `ring`：环形缓冲水位（平衡时应接近 0%，99% 说明消费端异常）。

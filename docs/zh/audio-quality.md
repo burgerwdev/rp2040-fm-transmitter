@@ -141,9 +141,11 @@ $ python3 tools/pll_range.py check 7074000 3000 2
 ... div=200 ... PDM step=30.000 kHz
 ```
 
-`refdiv 2` 在**所有**频段把步进减半，但 `main.py` 目前只在目标 >150 MHz
+`refdiv 2` 在**所有**频段把步进减半，但 `main.py` 原规则只在目标 >150 MHz
 （UHF 谐波）时设置 `refdiv 2`。注意 host 端无法算出环路滤波后的**残余**抖动
 （需要环路带宽与相噪实测），所以这里只能给出可计算的步进，残余量留给硬件实测。
+
+→ **已由改动 5 修复（§4）**：改为数据驱动规则并新增 `refdiv auto`。
 
 ### L2 环形缓冲可观测性（P2，已在 §4 改动 4 修复）
 
@@ -177,9 +179,10 @@ return (uint16_t)(((clamped - FM_VOL_MIN) * 32767) / (FM_VOL_MAX - FM_VOL_MIN));
 
 即音量滑条只有顶部约 10 dB 是准的。
 
+→ **已由改动 6 修复（§4）**。
+
 其余默认值（`DEFAULT_PREEMPH="on"(75us)`、`DEFAULT_SQUELCH=0`、
-`DEFAULT_CARRIER=87.9 MHz`）本身合理；问题在 `band` 预设的 `refdiv` 选择规则
-（见 L5）。
+`DEFAULT_CARRIER=87.9 MHz`）本身合理；`refdiv` 选择规则见 L5。
 
 ### L4 调制映射（可忽略）
 
@@ -366,6 +369,59 @@ THD (%)
 注意：计数器只能"看见"漂移，不能**纠正**它；hold-last 去掉的是 click，
 不是时间误差。真正的修复是 ASRC 或 UAC1 反馈端点（见下面的升级路径）。
 
+### 改动 5：refdiv 策略与控制台默认值（L5）
+
+- 新增 `refdiv_for(target)`：**载波需要停波的频段用 1，其余用 2**。
+  广播 FM（87.5–108 MHz）静音时停载波，而 refdiv 2 会改变停波时的 PDM
+  图案并在静音载波上产生可听嗡声（硬件实测，即 v0.22.x 的 FM 静音回归），
+  所以它必须保持 1；2m/UHF/窄带短波静音时关断射频，没有停载波，所以用 2。
+- `band_apply()`、`band` 命令与启动时的 `apply_config()` 都改用该函数
+  （原来只看 `target > 150 MHz`）；控制台新增 `refdiv <1|2|auto>`，
+  默认 auto；配置里的显式 1/2 优先。
+- 启动时若 refdiv 2 的窗口求解失败，自动回退到 refdiv 1（失败的 `init`
+  不会启动 core1，重试安全），并把 1 写回配置。
+- `status` 新增实际 PDM step（`pico_fm.range()` 的窗口宽度就是一个
+  反馈分频步）。
+
+```
+$ python3 tools/pll_range.py minstep 1800000 30000000 50000 3000 --refdiv 2
+  windows with a solution: 559, without: 6
+  first-found is NOT the minimum step in 0 window(s)
+$ python3 tools/pll_range.py minstep 80000000 500000000 500000 5000 --refdiv 2
+  windows with a solution: 129, without: 712
+  first-found is NOT the minimum step in 0 window(s)
+```
+
+即 C 的 `calculate_pll_divider()` 取到的已经是同 pass 内 step 最小的解，
+无需改动搜索逻辑（验证代替猜测）。
+
+| 频段 | 改前 step | 改后 step |
+|---|---|---|
+| FM 98.0 MHz（停波） | 750 kHz（refdiv 1） | 750 kHz（保持 1，避免静音嗡声） |
+| 2m 145.0 MHz | 1.2 MHz（refdiv 1） | **600 kHz**（refdiv 2） |
+| 433.92 MHz（×3） | 600 kHz（refdiv 2） | 600 kHz（不变） |
+| 30m 10.136 MHz | 80 kHz（refdiv 1） | **40 kHz**（refdiv 2） |
+| 20m 14.074 MHz | 120 kHz | **60 kHz** |
+| 10m 28.074 MHz | 240 kHz | **120 kHz** |
+
+### 改动 6：UAC1 音量真正的 dB 映射（L6）
+
+- 新增 `fm_vol_table[61]`（-0..-60 dB 每 dB 一个 `round(32767*10^(dB/20))`），
+  `fm_db256_to_gain()` 按整数 dB + 1/256 dB 余数插值；
+  `fm_gain_to_db256()` 为单调表的逆查（往返误差 0）。
+- 只改两个定点辅助函数，不在 ISR 路径上，无浮点。
+
+| 请求 (dB) | 改前实际 (dB) | 改前误差 | 改后实际 (dB) | 改后误差 |
+|---|---|---|---|---|
+| −6 | −0.92 | +5.08 | −6.00 | −0.00 |
+| −12 | −1.94 | +10.06 | −12.00 | +0.00 |
+| −20 | −3.52 | +16.48 | −20.00 | +0.00 |
+| −30 | −6.02 | +23.98 | −30.00 | −0.00 |
+| −40 | −9.54 | +30.46 | −39.99 | +0.01 |
+| −60 | −∞ | — | −59.94 | +0.06 |
+
+插值最差误差：0…−30 dB 内 0.015 dB，全程 0.26 dB（`-60 dB` 处，已是 60 dB 衰减）。
+
 ### 改动前后对比（`audio_quality.py compare`）
 
 | 指标 | 改前 | 改后 |
@@ -381,14 +437,18 @@ THD (%)
 | 欠载（漂移）最大阶跃 | 27591 | **7053** |
 | 欠载时的 THD | 0.035 % | **0.008 %** |
 | 丢样/欠载可观测性 | 无计数器 | `pico_fm.ring_stats()` |
+| 2m 的 PDM 抖动步进 | 1.2 MHz | **600 kHz** |
+| 30m 的 PDM 抖动步进 | 80 kHz | **40 kHz** |
+| refdiv 选择 | 仅看 >150 MHz | **`refdiv_for()` + `refdiv auto`** |
+| 音量 −30 dB 请求的实际衰减 | −6.0 dB（误差 +24 dB） | **−30.0 dB（误差 0）** |
 
 ## 5. 后续项
 
 | 项 | 状态 |
 |---|---|
 | L1/L2：欠载保持 + 丢样/欠载计数器 | **已完成（改动 4）**；残余：无 ASRC/反馈端点，漂移仍存在 |
-| L5：所有频段默认 `refdiv 2` | task-4 |
-| L6：UAC1 音量真正的 dB 映射 | task-4 |
+| L5：refdiv 策略与 `refdiv auto` | **已完成（改动 5）**；残余：环路滤波后的**残余**抖动仍需硬件实测 |
+| L6：UAC1 音量真正的 dB 映射 | **已完成（改动 6）**（最差插值误差 0.26 dB，0…−30 dB 内 0.015 dB） |
 | 限幅器前瞻 | 未实施（收益取决于节目素材；改动 1 已消除主要的伪失真来源） |
 | ASRC / UAC1 反馈端点 | 未实施（需要 ISR 预算或 TinyUSB 反馈支持，属于结构改动） |
 
