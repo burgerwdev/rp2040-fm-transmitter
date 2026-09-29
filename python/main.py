@@ -207,7 +207,7 @@ RP2040 RF Transmitter console - commands (values in Hz unless stated):
   ledpin ws2812 [gpio] use a WS2812 NeoPixel as the status LED
   vbar                 audio level meter (T = sq threshold; 'silent' when quiet)
   ring                 ring buffer fill % (watch for under/overflow)
-  diag                 ISR/RX rates over 1s (both ~48000/s while streaming)
+  diag [s]             ISR/RX rates + ring drift counters (default 1s, max 60)
   pwm                  PWM slice registers + ISR cost
   cls                  clear the terminal screen
   sweep [lo hi step]   pause audio and sweep the carrier (PLL self-test)
@@ -373,15 +373,17 @@ ring - ring buffer fill in percent.
   Near 0% = producer/consumer balanced; 99% = the consumer stalled
   (check `diag`).  Example: ring""",
     "diag": """\
-diag - measure ISR/RX rates and ring-buffer health over 1 second.
+diag [seconds] - measure ISR/RX rates and ring-buffer health (default 1 s).
   ISR ticks and RX frames should both be ~48000/s while streaming; a low
   ISR rate means the 48kHz sample IRQ is being starved.
   Underflows = empty-ring ticks while the host is streaming (host-vs-PWM
   crystal drift).  The last sample is repeated, so these are inaudible
   drift events, not clicks - the counter is the only trace of them.
-  Drops = host samples discarded because the ring was full.  Both grow at
-  ~48000 * ppm * 1e-6 per second; 0 means the clocks are an exact match.
-  Example: diag""",
+  Drops = host samples discarded because the ring was full.
+  Both are reported as a clock offset in ppm, computed against the PWM tick
+  count (so the estimate does not depend on how long the sleep really took).
+  A longer window sharpens it: 'diag 10' is 10x finer than 'diag'.
+  Example: diag 10""",
     "pwm": """\
 pwm - PWM slice-7 registers + measured ISR cost (diagnostics).
   Expected: TOP=999, DIV=/1.0, clk_sys=48000000, ISR cost ~2-6 us.
@@ -1125,27 +1127,44 @@ def do_command(line):
             print("ISR cost    : ~%d us/call (expect ~2-6)" % cost)
             print("ISR rate    : %d/s over 1s (expect ~48000)" % (i1 - i0))
         elif cmd == "diag":
+            # Optional window length: a longer window divides the 1-sample
+            # quantisation of the counters, so the ppm estimate gets sharper
+            # (1 s -> ~21 ppm steps, 10 s -> ~2 ppm).
+            secs = 1
+            if arg is not None:
+                v = parse_int(arg, "seconds")
+                if v is None:
+                    return
+                secs = max(1, min(60, v))
             i0, r0 = pico_fm.diag()
             u0, d0 = ring_stats()
-            time.sleep_ms(1000)
+            time.sleep_ms(secs * 1000)
             i1, r1 = pico_fm.diag()
             u1, d1 = ring_stats()
-            print("ISR ticks : %d -> %d   (+%d in 1s, expect ~48000)"
-                  % (i0, i1, i1 - i0))
-            print("RX frames : %d -> %d   (+%d in 1s, expect ~48000 while streaming)"
-                  % (r0, r1, r1 - r0))
+            di, dr = i1 - i0, r1 - r0
+            print("window    : %d s, PWM ticks +%d (~%.0f/s over this window)"
+                  % (secs, di, di / secs))
+            print("ISR ticks : %d -> %d   (+%d, expect ~%d)"
+                  % (i0, i1, di, 48000 * secs))
+            print("RX frames : %d -> %d   (+%d, expect ~%d while streaming)"
+                  % (r0, r1, dr, 48000 * secs))
             if u1 is None:
                 print("ring drift: (firmware has no ring_stats; update the firmware)")
             else:
-                print("Underflows: %d -> %d   (+%d in 1s, host clock slower than PWM)"
-                      % (u0, u1, u1 - u0))
-                print("Drops     : %d -> %d   (+%d in 1s, host clock faster than PWM)"
-                      % (d0, d1, d1 - d0))
-                if (u1 - u0) == 0 and (d1 - d0) == 0:
-                    print("            clocks matched within 1 sample/s this second")
+                du, dd = u1 - u0, d1 - d0
+                print("Underflows: %d -> %d   (+%d, host clock slower than PWM)"
+                      % (u0, u1, du))
+                print("Drops     : %d -> %d   (+%d, host clock faster than PWM)"
+                      % (d0, d1, dd))
+                if du == 0 and dd == 0:
+                    print("            no drift event in this window")
                 else:
-                    print("            ~%.1f ppm equivalent" % (
-                        (u1 - u0 + d1 - d0) * 1e6 / 48000.0))
+                    # ppm relative to the PWM clock, using the ISR tick count as
+                    # the time base: independent of how long the sleep really
+                    # took (sleep_ms(1000) overshoots by ~0.6% with the console
+                    # overhead, which would bias a /48000-based estimate).
+                    print("            ~%.1f ppm clock offset (%.1f events/s)"
+                          % ((du + dd) * 1e6 / max(di, 1), (du + dd) / secs))
             print("ring %d%% full, last ISR freq %.3f MHz"
                   % (pico_fm.ring_level(), pico_fm.current_freq() / 1e6))
         elif cmd == "sweep":
