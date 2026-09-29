@@ -44,8 +44,10 @@ band 433   433.92 MHz  ISM/ham, 3rd harmonic — handheld UHF, WIDE mode
 band 446   446.00625 MHz  PMR446 ch1, 3rd harmonic (EU)
 ```
 
-Each preset sets the carrier/deviation, the PLL reference divider (UHF uses
-refdiv 2 — the half PDM step that makes the harmonic links clean), the
+Each preset sets the carrier/deviation, the PLL reference divider (every band
+that keys the RF off when silent uses refdiv 2 — the half PDM step that makes
+narrowband/harmonic links clean; broadcast FM keeps refdiv 1 because a parked
+carrier with refdiv 2 has an audible idle tone), the
 silence mode and the NFM voice-band audio automatically, then reboots.
 Handheld-radio notes:
 

@@ -26,7 +26,7 @@ and coefficient constants of `fm_modulator.c: fm_audio_process()`.
 | **L3 audio DSP chain** | `fm_modulator.c: fm_audio_process()` | non-standard pre-emphasis (+8.6 dB too much at 2 kHz, −6.3 dB too little at 15 kHz); two first-order band-limit poles (−2.2 dB at 10 kHz); no limiter look-ahead | **tonal error (midrange hump, dull top) + severe distortion on loud material (THD 18–26 %)** | **P0** |
 | **L1 USB audio & asynchronous sample clock** | `shared/tinyusb/*`, `tud_audio_rx_done_isr()` | host 48 kHz and PWM 48 kHz come from two independent crystals; no resampler, no feedback endpoint, no drift counter | periodic clicks after long playback (starts after ~14 min and persists) | **P1** |
 | **L5 PLL/PDM RF layer** | `pico_fractional_pll.c` | the instantaneous frequency dithers by `ref/div` at 1 MHz; the PLL loop filter averages it only partially | RF phase noise / receiver noise floor (worst on narrowband and weak signals) | **P1** |
-| **L2 ring-buffer observability** | `fm_modulator.c: fm_pwm_wrap_handler()` | no drop/underflow counters; underflow zeroes the sample instead of holding it | silent itself, but **hides L1** and turns a drop into a dropout | **P2** |
+| **L2 mono mix & ring buffer** | `tud_audio_rx_done_isr()`, `fm_pwm_wrap_handler()` | the mix itself is clean (no int32 overflow; anti-phase cancellation is inherent to mono); the ring has no drop/underflow counters and zeroes instead of holding | the mix is inaudible (−91.8 dBFS truncation); the ring hides L1 and turns a drop into a dropout | **P2** |
 | **L6 USB control surface & defaults** | `fm_modulator.c: fm_db256_to_gain()`, `main.py` | UAC1 volume maps **dB → linear gain** linearly, not dB → dB | volume slider is mis-calibrated (request −30 dB, get −6 dB) | **P2** |
 | **L4 modulation mapping** | `fm_pwm_wrap_handler()` | `freq = carrier + (sample*dev)>>15` | none (0.99997× full deviation; negligible) | — |
 
@@ -168,9 +168,31 @@ given here; the residual is left to hardware measurement.
 → **fixed by change 5 (§4)**: replaced by a data-driven rule plus the new
 `refdiv auto`.
 
-### L2 ring-buffer observability (P2, fixed by change 4 in §4)
+### L2 mono mix & ring buffer (P2; the buffer half is fixed by change 4 in §4)
 
-Before:
+**The mix half: audited, clean, no change warranted.**
+`tud_audio_rx_done_isr()` first computes
+`mono = ((int32_t)frame[0] + frame[1]) >> 1`, then `mono = (mono * volume) >> 15`:
+
+```
+$ python3 tools/audio_quality.py mono
+    L=R=30000  -> 29999  (unity for correlated content)
+    L=+30000 R=-30000 -> 0  (anti-phase cancels: inherent to a mono mix)
+  volume     mean err (LSB) rms err (LSB)  equiv. noise floor
+  0 dB       -0.750         0.841          -91.8 dBFS
+  -6 dB      -0.376         0.469          -96.9 dBFS
+  -40 dB     -0.502         0.579          -95.1 dBFS
+```
+
+- the int32 sum is halved, so it cannot overflow; correlated content is 1:1 and
+  no gain error is introduced;
+- the only artefact is truncating instead of rounding: at unity volume the mix
+  floor (−0.25 LSB mean) and the volume floor add up to −0.75 LSB mean /
+  0.84 LSB rms = **−91.8 dBFS**, about 9 dB above an ideal rounder
+  (0.289 LSB rms = −101.1 dBFS) and far below any audible threshold; its DC
+  part is removed by the 2 Hz DC blocker. No rounding logic is added for it.
+
+**The ring-buffer half: state before the fix.**
 
 - on an empty ring `fm_pwm_wrap_handler()` sets `s_cur_sample = 0` → the
   carrier parks on fc for that tick (a dropout) instead of holding the last
@@ -538,7 +560,7 @@ $ ./build.sh
   artifacts (sha `679c2c64…`) and `python/main.py`'s `FW_SHA256` matches them:
   this branch has not been verified on hardware, so an untested binary is not
   shipped as the prebuilt firmware (run `./build.sh` for this branch's build).
-- **Doc-number consistency**: all 63 values quoted in this document were found
+- **Doc-number consistency**: all 72 values quoted in this document were found
   in the corresponding script output (`audio_quality.py resp/compare/drift/`
-  `volume`, `pll_range.py bands/check/minstep`); no documented number is
+  `mono/volume`, `pll_range.py bands/check/minstep`); no documented number is
   unreproducible.

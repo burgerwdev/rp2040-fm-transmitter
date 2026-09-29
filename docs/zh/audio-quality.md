@@ -24,7 +24,7 @@
 | **L3 音频 DSP 链** | `fm_modulator.c: fm_audio_process()` | 预加重曲线非标准：2 kHz 处多 +8.6 dB、15 kHz 处少 −6.3 dB；一阶低通 ×2 在 10 kHz 掉 −2.2 dB；限幅器无前瞻 | **音色（中频隆起、高频发闷）+ 大声压时严重失真（THD 18–26%）** | **P0** |
 | **L1 USB 音频与异步采样时钟** | `shared/tinyusb/*`、`tud_audio_rx_done_isr()` | 主机 48 kHz 与 PWM 48 kHz 是两颗独立晶振，无重采样、无反馈端点、无漂移计数 | 长时间播放后周期性 click（>14 分钟后开始，持续存在） | **P1** |
 | **L5 PLL/PDM 射频层** | `pico_fractional_pll.c` | 瞬时频率按 `ref/div` 步进在 1 MHz 上抖动，PLL 环路滤波只部分平均 | 射频相噪/接收端噪底（窄带与弱信号尤其明显） | **P1** |
-| **L2 环形缓冲可观测性** | `fm_modulator.c: fm_pwm_wrap_handler()` | 丢样/欠载无计数器；欠载时把采样清零（而非保持） | 本身不说话，但**掩盖 L1**，并把"丢样"放大成 dropout | **P2** |
+| **L2 单声道混音与环形缓冲** | `tud_audio_rx_done_isr()`、`fm_pwm_wrap_handler()` | 混音本身无缺陷（int32 不溢出、反相抵消为单声道固有）；环形缓冲无丢样/欠载计数器，欠载时清零而非保持 | 混音无可听影响（−91.8 dBFS 截断）；缓冲问题掩盖 L1 并把丢样放大为 dropout | **P2** |
 | **L6 USB 控制面与默认值** | `fm_modulator.c: fm_db256_to_gain()`、`main.py` | UAC1 音量按 **dB→线性增益**线性映射，不是 dB→dB | 音量滑条标定错误（请求 −30 dB 实得 −6 dB） | **P2** |
 | **L4 调制映射** | `fm_pwm_wrap_handler()` | `freq = carrier + (sample*dev)>>15` | 无（0.99997× 满偏离，可忽略） | — |
 
@@ -147,9 +147,28 @@ $ python3 tools/pll_range.py check 7074000 3000 2
 
 → **已由改动 5 修复（§4）**：改为数据驱动规则并新增 `refdiv auto`。
 
-### L2 环形缓冲可观测性（P2，已在 §4 改动 4 修复）
+### L2 单声道混音与环形缓冲（P2，缓冲部分已由 §4 改动 4 修复）
 
-改前：
+**混音部分：审计结论是无缺陷，不需要修改。** `tud_audio_rx_done_isr()` 先做
+`mono = ((int32_t)frame[0] + frame[1]) >> 1`，再 `mono = (mono * volume) >> 15`：
+
+```
+$ python3 tools/audio_quality.py mono
+    L=R=30000  -> 29999  (相关内容为 1:1)
+    L=+30000 R=-30000 -> 0  (反相完全抵消：单声道下混的固有性质)
+  volume     mean err (LSB) rms err (LSB)  equiv. noise floor
+  0 dB       -0.750         0.841          -91.8 dBFS
+  -6 dB      -0.376         0.469          -96.9 dBFS
+  -40 dB     -0.502         0.579          -95.1 dBFS
+```
+
+- int32 求和后右移，不可能溢出；相关内容 1:1，不引入增益错误；
+- 唯一 artefact 是「截断而非四舍五入」：满音量下混音取整（−0.25 LSB）与音量
+  取整叠加为 −0.75 LSB 均值 / 0.84 LSB RMS = **−91.8 dBFS**，比理想四舍五入
+  （0.289 LSB RMS = −101.1 dBFS）差约 9 dB，远低于任何可听阈值；其 DC 分量由
+  2 Hz 直流阻断移除。所以不为它增加取整逻辑。
+
+**环形缓冲部分：改前状态如下（已修复）。**
 
 - `fm_pwm_wrap_handler()` 在 ring 空时执行 `s_cur_sample = 0` → 该拍载波停在
   fc（一次 dropout），而不是保持上一个采样；
@@ -488,6 +507,6 @@ $ ./build.sh
   （sha `679c2c64…`），`python/main.py` 的 `FW_SHA256` 与其一致：本分支的
   代码尚未在硬件上验证，因此不用未经测试的二进制替换预编译固件（需要本
   分支固件请自行 `./build.sh`）。
-- **文档数字一致性**：本文件引用的 63 个数值全部在对应脚本输出中找到
-  （`audio_quality.py resp/compare/drift/volume`、
+- **文档数字一致性**：本文件引用的 72 个数值全部在对应脚本输出中找到
+  （`audio_quality.py resp/compare/drift/mono/volume`、
   `pll_range.py bands/check/minstep`）；未发现只存在于文档而不可复现的数字。

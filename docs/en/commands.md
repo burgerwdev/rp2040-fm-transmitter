@@ -15,7 +15,7 @@ All values are in Hz unless noted. Type `help` in the console anytime.
 | `dev <Hz>` | Set full-scale deviation (effective; 1000..half the PLL range x harmonic) | `dev 12000` |
 | `reinit <carrier> <dev> [pin]` | Save new carrier/deviation/pin and reboot (UHF 409/433/440M targets are converted to the 3rd/5th-harmonic fundamental automatically) | `reinit 433920000 12000 21` |
 | `pdm <1\|2\|3\|4>` | PDM dither rate in MHz (1 = default; >1 measured worse on hardware; saves and reboots) | `pdm 1` |
-| `refdiv <1\|2>` | PLL reference divider (2 measured neutral; saves and reboots) | `refdiv 1` |
+| `refdiv <1\|2\|auto>` | PLL reference divider (2 = half PDM step; auto is the default and keeps 1 on parked bands) | `refdiv auto` |
 | `pin <21\|23\|24\|25>` | Switch the RF output pin (saves and reboots) | `pin 21` |
 | `pwr <2\|4\|8\|12>` | RF drive strength in mA (transmit power); 8/12 give better even-harmonic suppression | `pwr 12` |
 | `rf on\|off` | RF output on/off | `rf on` |
@@ -61,8 +61,11 @@ All values are in Hz unless noted. Type `help` in the console anytime.
   (118-137MHz) — the console warns; suppress it with a band-pass filter.
 - **`pdm` / `refdiv`**: persisted and applied at the next reboot (a live
   PLL re-init without rebooting deadlocks the board - tested).  Hardware
-  results: pdm >1MHz is WORSE (systick latency / PLL write timing),
-  refdiv 2 is neutral - keep the defaults unless experimenting.
+  results: pdm >1MHz is WORSE (systick latency / PLL write timing).
+  `refdiv 2` halves the PDM dither step (`ref/div`) on every band, but it
+  must not be used where the carrier is parked (broadcast FM): the parked PDM
+  pattern changes and the silent carrier gets an audible idle tone.  Hence the
+  default `refdiv auto`: gated bands take 2, parked bands take 1.
   Use `tools/serial.sh` (tio auto-reconnect) so reboots do not kill your
   serial session.
 - **FM silence while the host keeps streaming**: `mute on` / `audio off`

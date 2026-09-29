@@ -331,6 +331,50 @@ def _ideal_deemph_db(f, tc_us):
     return 10 * np.log10(1 + (2 * np.pi * f * tc_us * 1e-6) ** 2)
 
 
+def cmd_mono(a):
+    """Stereo -> mono mix + volume, i.e. what tud_audio_rx_done_isr() does
+    before the DSP chain:  mono = (L + R) >> 1 ;  out = (mono * volume) >> 15.
+    """
+    rng = np.random.default_rng(7)
+    n = 200000
+    L = rng.integers(-32768, 32768, n).astype(np.int64)
+    R = rng.integers(-32768, 32768, n).astype(np.int64)
+
+    def rx(l, r, vol):
+        return ((l + r) >> 1) * vol >> 15
+
+    print("Stereo -> mono mix + volume (before the DSP chain)")
+    print("  monotonic behaviour:")
+    A = 30000
+    print("    L=R=%d  -> %d  (unity, correlated content)" % (
+        A, rx(np.int64(A), np.int64(A), 32767)))
+    print("    L=+%d R=-%d -> %d  (anti-phase cancels: inherent to a mono mix)" % (
+        A, A, rx(np.int64(A), np.int64(-A), 32767)))
+    print("  quantization vs the ideal float mix+gain (random stereo, n=%d):" % n)
+    print("  %-10s %-14s %-14s %s" % ("volume", "mean err (LSB)",
+                                        "rms err (LSB)", "equiv. noise floor"))
+    for vol, label in ((32767, "0 dB"), (16384, "-6 dB"), (3277, "-20 dB"),
+                       (328, "-40 dB")):
+        got = rx(L, R, vol).astype(np.float64)
+        ideal = (L + R) / 2.0 * vol / 32768.0
+        err = got - ideal
+        rms = float(np.sqrt(np.mean(err ** 2)))
+        floor = 20 * np.log10(max(rms, 1e-9) / 32768.0)
+        print("  %-10s %-14.3f %-14.3f %.1f dBFS" % (
+            label, float(np.mean(err)), rms, floor))
+    print()
+    print("  Reading: the mix is a plain average, so it is unity for correlated")
+    print("  content (29999 vs 30000 is the truncation below), cancels anti-phase")
+    print("  (L-R) content by definition, and cannot overflow (the int32 sum is")
+    print("  halved).  The only artefact is truncating instead of rounding: at")
+    print("  unity volume the mix floor (-0.25 LSB mean) and the volume floor add")
+    print("  up to -0.75 LSB mean and 0.84 LSB rms = -91.8 dBFS, i.e. ~9 dB above")
+    print("  an ideal rounder (0.289 LSB rms = -101.1 dBFS), and far below")
+    print("  anything audible; the DC part is removed by the 2 Hz DC blocker.")
+    print("  Verdict: no change warranted.")
+    return None
+
+
 def cmd_volume(a):
     """UAC1 volume mapping: old linear dB->gain vs the new table.
 
@@ -629,7 +673,8 @@ def main():
 
     for name, fn in (("resp", cmd_resp), ("thd", cmd_thd),
                      ("limiter", cmd_limiter), ("drift", cmd_drift),
-                     ("volume", cmd_volume), ("compare", cmd_compare)):
+                     ("mono", cmd_mono), ("volume", cmd_volume),
+                     ("compare", cmd_compare)):
         p = sub.add_parser(name)
         p.set_defaults(func=fn)
 
