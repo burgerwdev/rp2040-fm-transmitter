@@ -331,6 +331,67 @@ def _ideal_deemph_db(f, tc_us):
     return 10 * np.log10(1 + (2 * np.pi * f * tc_us * 1e-6) ** 2)
 
 
+def cmd_volume(a):
+    """UAC1 volume mapping: old linear dB->gain vs the new table.
+
+    Mirrors fm_modulator.c fm_db256_to_gain()/fm_gain_to_db256() exactly.
+    """
+    tbl = [32767, 29204, 26028, 23197, 20675, 18426, 16422, 14636,
+           13045, 11626, 10362, 9235, 8231, 7336, 6538, 5827,
+           5193, 4628, 4125, 3677, 3277, 2920, 2603, 2320,
+           2067, 1843, 1642, 1464, 1304, 1163, 1036, 923,
+           823, 734, 654, 583, 519, 463, 413, 368,
+           328, 292, 260, 232, 207, 184, 164, 146,
+           130, 116, 104, 92, 82, 73, 65, 58,
+           52, 46, 41, 37, 33]
+
+    def gain_new(db256):      # table + 1/256 dB interpolation
+        mag = -db256
+        if mag < 0:
+            mag = 0
+        if mag > 15360:
+            mag = 15360
+        i, f = mag >> 8, mag & 0xFF
+        if i >= 60:
+            return tbl[60]
+        return tbl[i] + (((tbl[i + 1] - tbl[i]) * f) >> 8)
+
+    def gain_old(db256):      # the old linear dB -> linear gain mapping
+        c = max(-15360, min(0, db256))
+        return ((c + 15360) * 32767) // 15360
+
+    def db(g):
+        return -999.0 if g <= 0 else 20 * np.log10(g / 32767.0)
+
+    def db256_new(gain):      # inverse search (fm_gain_to_db256)
+        if gain > 32767:
+            gain = 32767
+        for i in range(60):
+            if gain >= tbl[i + 1]:
+                span = tbl[i] - tbl[i + 1]
+                off = tbl[i] - gain
+                return -((i << 8) + (((off << 8) // span) if span > 0 else 0))
+        return -15360
+
+    print("UAC1 volume mapping (requested dB -> actual attenuation)")
+    print("  %-10s %14s %10s %14s %10s" % (
+        "requested", "old actual", "old err", "new actual", "new err"))
+    for r in (-6, -12, -20, -30, -40, -50, -60):
+        o, n = gain_old(r * 256), gain_new(r * 256)
+        print("  %-10d %14.2f %+10.2f %14.2f %+10.2f" % (
+            r, db(o), db(o) - r, db(n), db(n) - r))
+    print()
+    for lo in (-30, -40, -50, -60):
+        worst = max(abs(db(gain_new(d)) - d / 256.0)
+                    for d in range(lo * 256, 1))
+        print("  worst new error over [%d, 0] dB: %.3f dB" % (lo, worst))
+    rt = max(abs(gain_new(db256_new(g)) - g)
+             for g in (tbl[0], tbl[10], tbl[30], tbl[59], tbl[60]))
+    print("  table round-trip (gain -> dB256 -> gain) max error: %d" % rt)
+    print()
+    return None
+
+
 def cmd_compare(a):
     """Before/after for the audio-quality rework (task-2)."""
     bl = [1000, 5000, 8000, 10000, 12000, 14000, 15000, 16000, 18000,
@@ -568,7 +629,7 @@ def main():
 
     for name, fn in (("resp", cmd_resp), ("thd", cmd_thd),
                      ("limiter", cmd_limiter), ("drift", cmd_drift),
-                     ("compare", cmd_compare)):
+                     ("volume", cmd_volume), ("compare", cmd_compare)):
         p = sub.add_parser(name)
         p.set_defaults(func=fn)
 
@@ -585,7 +646,7 @@ def main():
 
     a = ap.parse_args()
     if a.cmd == "all":
-        for fn in (cmd_resp, cmd_thd, cmd_limiter, cmd_drift):
+        for fn in (cmd_resp, cmd_thd, cmd_limiter, cmd_drift, cmd_volume):
             ns = argparse.Namespace(ring=4096, seconds=600.0)
             print("=" * 72)
             print(fn.__name__.replace("cmd_", "").upper())

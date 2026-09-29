@@ -510,3 +510,35 @@ range (at −60 dB, i.e. already 60 dB of attenuation).
 - **RF measurements** (phase noise, residual ripple, real received audio): this
   goal explicitly excludes hardware measurement; the "residual ripple" in item 5
   above can only be settled by measurement.
+
+---
+
+## 7. Regression verification (compile only, nothing flashed)
+
+```
+$ ./build.sh
+==> Building RPI_PICO_FM firmware, MicroPython ref: v1.29.0
+    trying https://git.sr.ht/~bytewolf/micropython ...
+    patch applied
+    source: https://git.sr.ht/~bytewolf/micropython
+[100%] Built target firmware
+==> Done: firmware/rp2040pico_fm_firmware.uf2
+   FLASH 350180 B / 640 KB (53.43%), RAM 36812 B / 256 KB (14.04%)
+```
+
+- `./build.sh` completed end-to-end on a **clean clone** (clone → apply patch →
+  `make submodules` → build); the resulting UF2 has sha256
+  `810e9e0bd8599ef11051de81aa9a65a28e35ca4b39bf30caf9983b11f6018ebb`.
+- **Patch round-trip**: regenerating the patch after applying
+  `patches/micropython-fm.patch` to a clean MicroPython gives **0 diff** against
+  the committed patch, i.e. the patch is self-consistent and reproduces this
+  build exactly.
+- **Nothing was flashed and the board was not rebooted.** The tracked
+  `firmware/*.uf2` and `firmware/sha256.txt` are still the v0.23.1 release
+  artifacts (sha `679c2c64…`) and `python/main.py`'s `FW_SHA256` matches them:
+  this branch has not been verified on hardware, so an untested binary is not
+  shipped as the prebuilt firmware (run `./build.sh` for this branch's build).
+- **Doc-number consistency**: all 63 values quoted in this document were found
+  in the corresponding script output (`audio_quality.py resp/compare/drift/`
+  `volume`, `pll_range.py bands/check/minstep`); no documented number is
+  unreproducible.

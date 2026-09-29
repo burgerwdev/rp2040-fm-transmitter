@@ -462,3 +462,32 @@ $ python3 tools/pll_range.py minstep 80000000 500000000 500000 5000 --refdiv 2
 - **AM/SSB/DRM**：本链路是固定幅度方波 + 纯频率调制，需要外部线性调制级。
 - **射频实测**（相噪、残余抖动、实际接收音质）：本目标明确不做硬件实测；
   上表第 5 项的"残余抖动"只能由实测确定。
+
+---
+
+## 7. 回归验证（编译，不刷写）
+
+```
+$ ./build.sh
+==> Building RPI_PICO_FM firmware, MicroPython ref: v1.29.0
+    trying https://git.sr.ht/~bytewolf/micropython ...
+    patch applied
+    source: https://git.sr.ht/~bytewolf/micropython
+[100%] Built target firmware
+==> Done: firmware/rp2040pico_fm_firmware.uf2
+   FLASH 350180 B / 640 KB (53.43%), RAM 36812 B / 256 KB (14.04%)
+```
+
+- `./build.sh` 在**干净克隆**上全流程成功（克隆 → 打补丁 → `make submodules`
+  → 编译），产出 UF2 的 sha256 为
+  `810e9e0bd8599ef11051de81aa9a65a28e35ca4b39bf30caf9983b11f6018ebb`。
+- **补丁往返校验**：在干净 MicroPython 上应用 `patches/micropython-fm.patch`
+  后重新生成的补丁与仓库中的补丁 **0 差异**，说明补丁自洽且能精确复现该构建。
+- **没有刷写、没有重启开发板。** 仓库中已跟踪的 `firmware/*.uf2` 与
+  `firmware/sha256.txt` 仍是 v0.23.1 的发布产物
+  （sha `679c2c64…`），`python/main.py` 的 `FW_SHA256` 与其一致：本分支的
+  代码尚未在硬件上验证，因此不用未经测试的二进制替换预编译固件（需要本
+  分支固件请自行 `./build.sh`）。
+- **文档数字一致性**：本文件引用的 63 个数值全部在对应脚本输出中找到
+  （`audio_quality.py resp/compare/drift/volume`、
+  `pll_range.py bands/check/minstep`）；未发现只存在于文档而不可复现的数字。

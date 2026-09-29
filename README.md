@@ -52,8 +52,10 @@ band 409   -> 409.75 MHz license-free PMR on the 3rd harmonic
 ```
 
 For a handheld radio use **WIDE (25kHz)** mode and keep the deviation around
-12kHz; on UHF the console sets `refdiv 2` automatically (the half PDM step is
-what makes the harmonic links sound clean).  When there is no audio the
+12kHz; the console sets `refdiv 2` automatically on every band that keys the RF
+off when silent (the half PDM step is what makes the harmonic links sound
+clean).  Broadcast FM keeps `refdiv 1` because a parked carrier with refdiv 2
+has an audible idle tone.  When there is no audio the
 narrowband bands key the RF output off (PTT-style) so the handheld squelch
 closes instead of hearing an off-tune parked carrier - use `silence park` to
 restore the broadcast behaviour.  For a serial session that survives reboots:
