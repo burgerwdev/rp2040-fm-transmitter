@@ -19,3 +19,6 @@ firmware/sha256.txt.tmp
 
 # Tooling
 *.log
+
+# pi goal/session state
+.pi/
