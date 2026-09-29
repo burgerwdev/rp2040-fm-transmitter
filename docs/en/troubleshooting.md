@@ -48,13 +48,27 @@ firmware uses a unique identity (0x1209:0xFA50). If leftover devices appear:
 ## Upload tool picks the wrong serial port
 
 With several ttyACM devices attached (e.g. the ADALM-Pluto's own serial
-console) `tools/upload.sh` / `tools/serial.sh` resolve the board by its USB ID
-**1209:fa50** instead of taking the first port.  To force one:
+console) `tools/upload.sh` / `tools/serial.sh` do not take "the first port";
+they resolve it by USB ID:
+
+1. `1209:fa50` — **this firmware's own ID**, set in
+   `ports/rp2/boards/RPI_PICO_FM/mpconfigboard.h` (`MICROPY_HW_USB_VID/PID`).
+   It is independent of the board model: a Pico, Pico W, RP2040-Zero or a
+   clone running this firmware all enumerate with it.
+2. generic MicroPython RP2040 (`2e8a:0005`, or a description containing
+   MicroPython) — for a board **not yet flashed** with this firmware; a note
+   is printed to stderr.
+3. the `/dev/pico` udev symlink, then `/dev/serial/by-id/*RP2040*`.
+
+If tiers 1/2 match more than one device the tool does **not** guess: it lists
+the candidates and asks for an explicit port:
 
 ```bash
 FM_PORT=/dev/ttyACM1 tools/upload.sh
+./tools/upload.sh --port /dev/ttyACM1
 ./tools/serial.sh /dev/ttyACM1
 tools/pico_port.sh                 # print the resolved port, or list candidates
+tools/pico_port.sh --self-test     # hardware-free self-check
 ```
 
 `could not enter raw repl` with a login prompt or garbage captured means the

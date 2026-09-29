@@ -42,13 +42,24 @@
 ## 上传脚本找不到板子 / 选错了串口
 
 机上同时插了多块 ttyACM 设备（如 ADALM-Pluto 自带的串口控制台）时，
-`tools/upload.sh` / `tools/serial.sh` 会按 USB ID **1209:fa50** 定位开发板，
-不会误选。手动指定：
+`tools/upload.sh` / `tools/serial.sh` 不会取“第一个串口”，而是按 USB ID 定位：
+
+1. `1209:fa50` —— **本固件自己的 ID**（写在
+   `ports/rp2/boards/RPI_PICO_FM/mpconfigboard.h` 的 `MICROPY_HW_USB_VID/PID`）。
+   它与板型无关：Pico / Pico W / RP2040-Zero / 克隆板只要刷了本固件，
+   枚举出来都是这个 ID。
+2. 通用 MicroPython RP2040（`2e8a:0005` 或描述含 MicroPython）—— 板子**还没刷**
+   本固件时用，会在 stderr 给出提示。
+3. `/dev/pico` udev 符号链、`/dev/serial/by-id/*RP2040*`。
+
+第 1/2 层如果有多个设备同时匹配，脚本**不会猜**，而是列出候选并让你显式指定：
 
 ```bash
 FM_PORT=/dev/ttyACM1 tools/upload.sh
+./tools/upload.sh --port /dev/ttyACM1
 ./tools/serial.sh /dev/ttyACM1
 tools/pico_port.sh                 # 只打印解析到的端口，或列出候选设备
+tools/pico_port.sh --self-test     # 无需硬件的自检
 ```
 
 报 `could not enter raw repl` 且捕获到别的登录提示或乱码，通常就是选错了
