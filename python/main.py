@@ -120,6 +120,19 @@ def dev_fund_of(dev_eff, harmonic):
     return max(1, round(dev_eff / harmonic))
 
 
+def ring_stats():
+    """(underflows, drops) from the firmware, or (None, None) on older builds.
+
+    Underflows are empty-ring ticks while the host is streaming (host-clock
+    vs PWM-clock drift); the last sample is repeated, so they are inaudible.
+    Drops are host samples discarded because the ring was full.  Both grow at
+    about 48000 * ppm * 1e-6 per second.
+    """
+    if hasattr(pico_fm, "ring_stats"):
+        return pico_fm.ring_stats()
+    return None, None
+
+
 def build_help():
     """Compact command reference (static text).  Full dynamic ranges are
     shown by `status`; key behaviour notes are kept inline."""
@@ -322,9 +335,14 @@ ring - ring buffer fill in percent.
   Near 0% = producer/consumer balanced; 99% = the consumer stalled
   (check `diag`).  Example: ring""",
     "diag": """\
-diag - measure ISR/RX rates over 1 second.
-  Both should be ~48000/s while streaming.  A low ISR rate means the
-  48kHz sample IRQ is being starved.
+diag - measure ISR/RX rates and ring-buffer health over 1 second.
+  ISR ticks and RX frames should both be ~48000/s while streaming; a low
+  ISR rate means the 48kHz sample IRQ is being starved.
+  Underflows = empty-ring ticks while the host is streaming (host-vs-PWM
+  crystal drift).  The last sample is repeated, so these are inaudible
+  drift events, not clicks - the counter is the only trace of them.
+  Drops = host samples discarded because the ring was full.  Both grow at
+  ~48000 * ppm * 1e-6 per second; 0 means the clocks are an exact match.
   Example: diag""",
     "pwm": """\
 pwm - PWM slice-7 registers + measured ISR cost (diagnostics).
@@ -576,6 +594,9 @@ def show_status():
     print("Audio routing  : %s" % ("ON" if AUDIO_ON else "OFF"))
     print("Host streaming : %s" % ("yes" if pico_fm.audio_active() else "no"))
     print("Ring buffer    : %d%% full" % pico_fm.ring_level())
+    u, d = ring_stats()
+    if u is not None:
+        print("Ring drift     : %d underflows, %d drops" % (u, d))
     print("Volume         : %d%%" % vol_pct(pico_fm.volume()))
     print("Mute           : %s" % ("yes" if pico_fm.muted() else "no"))
     pre_txt = {"on": "on (75us)", "50": "on (50us)", "300": "on (300us)", "off": "off"}.get(PREEMPH, "on (75us)")
@@ -1058,12 +1079,26 @@ def do_command(line):
             print("ISR rate    : %d/s over 1s (expect ~48000)" % (i1 - i0))
         elif cmd == "diag":
             i0, r0 = pico_fm.diag()
+            u0, d0 = ring_stats()
             time.sleep_ms(1000)
             i1, r1 = pico_fm.diag()
+            u1, d1 = ring_stats()
             print("ISR ticks : %d -> %d   (+%d in 1s, expect ~48000)"
                   % (i0, i1, i1 - i0))
             print("RX frames : %d -> %d   (+%d in 1s, expect ~48000 while streaming)"
                   % (r0, r1, r1 - r0))
+            if u1 is None:
+                print("ring drift: (firmware has no ring_stats; update the firmware)")
+            else:
+                print("Underflows: %d -> %d   (+%d in 1s, host clock slower than PWM)"
+                      % (u0, u1, u1 - u0))
+                print("Drops     : %d -> %d   (+%d in 1s, host clock faster than PWM)"
+                      % (d0, d1, d1 - d0))
+                if (u1 - u0) == 0 and (d1 - d0) == 0:
+                    print("            clocks matched within 1 sample/s this second")
+                else:
+                    print("            ~%.1f ppm equivalent" % (
+                        (u1 - u0 + d1 - d0) * 1e6 / 48000.0))
             print("ring %d%% full, last ISR freq %.3f MHz"
                   % (pico_fm.ring_level(), pico_fm.current_freq() / 1e6))
         elif cmd == "sweep":

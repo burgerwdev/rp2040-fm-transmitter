@@ -29,7 +29,7 @@
 | `ledpin ws2812 [引脚]` | 使用 WS2812 彩灯（默认 GPIO16） | `ledpin ws2812` |
 | `vbar` | 音频电平表（~50fps）：峰值条 + 静噪阈值（T 标记）+ 削波速率；输入安静时显示 "silent"（慢刷新）；任意键退出 | `vbar` |
 | `ring` | 环形缓冲水位 % | `ring` |
-| `diag` | 1 秒内实测 ISR/RX 速率（应各 ~48000） | `diag` |
+| `diag` | 1 秒内实测 ISR/RX 速率（应各 ~48000）与环形缓冲漂移计数（underflow/drop） | `diag` |
 | `pwm` | PWM/ISR 诊断 | `pwm` |
 | `pll` | PLL 诊断（ready/范围/最后写入频率） | `pll` |
 | `sweep [低 高 步长]` | 暂停音频扫频（PLL 自检） | `sweep 87000000 88500000 500000` |

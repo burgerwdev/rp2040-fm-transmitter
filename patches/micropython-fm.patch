@@ -118,10 +118,10 @@ index 0000000..16e3340
 +LED,GPIO25
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.c b/ports/rp2/fm_transmitter/fm_modulator.c
 new file mode 100644
-index 0000000..7d38273
+index 0000000..98ed877
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.c
-@@ -0,0 +1,905 @@
+@@ -0,0 +1,941 @@
 +/*
 + * fm_modulator.c
 + *
@@ -312,18 +312,44 @@ index 0000000..7d38273
 +static volatile bool s_rf_gated;       // output currently keyed off
 +static volatile uint32_t s_empty_ticks; // consecutive silent ticks
 +
++// Ring-buffer health.  Both glitch sources were previously invisible: `diag`
++// only reported the ISR tick count and the RX frame count, so a drifting host
++// clock produced clicks that no counter could show.
++//
++//  s_ring_underflows - empty-ring ticks while the host IS streaming, i.e.
++//                      host-vs-PWM clock drift.  The sample is repeated
++//                      (hold-last) so the event is inaudible; the counter is
++//                      the only trace of it.
++//  s_ring_drops      - host samples dropped because the ring was full.
++static volatile uint32_t s_ring_underflows;
++static volatile uint32_t s_ring_drops;
++static uint32_t s_underflow_run;        // consecutive empty ticks (not volatile:
++                                        // only touched in the PWM ISR)
++// After this many consecutive empty ticks the host has really stopped (not
++// drifting): park the carrier on fc as before.  480 ticks = 10 ms at 48 kHz,
++// far longer than any single-tick drift event.
++#define FM_UNDERFLOW_HOLD_TICKS (480)
++
 +static void __time_critical_func(fm_pwm_wrap_handler)(void) {
 +    pwm_clear_irq(FM_PWM_SLICE);
 +    s_isr_ticks++;
 +
-+    // Pop one mono sample.  On underflow (host paused / not streaming) park
-+    // the sample on 0 so the carrier sits exactly on fc instead of drifting
-+    // to whatever the last frame happened to be.
++    // Pop one mono sample.  Two different situations share the empty ring:
++    //  - host streaming but momentarily behind (clock drift): repeat the last
++    //    sample.  A one-sample time stretch is inaudible, whereas zeroing the
++    //    sample is a step discontinuity (a click) every drift event;
++    //  - host paused / stopped / not selected: park on 0 so the carrier sits
++    //    exactly on fc (the verified v0.22.3 behaviour) instead of drifting to
++    //    whatever the last frame happened to be.
 +    uint16_t tail = s_ring_tail;
 +    bool empty = (tail == s_ring_head);
 +    if (!empty) {
 +        s_cur_sample = s_ring[tail];
 +        s_ring_tail = (uint16_t)((tail + 1) & FM_RING_MASK);
++        s_underflow_run = 0;
++    } else if (s_audio_active && s_underflow_run < FM_UNDERFLOW_HOLD_TICKS) {
++        s_underflow_run++;
++        s_ring_underflows++;
 +    } else {
 +        s_cur_sample = 0;
 +    }
@@ -417,6 +443,9 @@ index 0000000..7d38273
 +    s_gate_silent = false;
 +    s_rf_gated = false;
 +    s_empty_ticks = 0;
++    s_ring_underflows = 0;
++    s_ring_drops = 0;
++    s_underflow_run = 0;
 +    s_last_freq = 0; // 0 until the 48kHz ISR has written at least once
 +    s_led_mode = 0;
 +    s_led_peak = 0;
@@ -754,6 +783,11 @@ index 0000000..7d38273
 +    *rx_frames = s_rx_frames;
 +}
 +
++void fm_modulator_get_ring_stats(uint32_t *underflows, uint32_t *drops) {
++    *underflows = s_ring_underflows;
++    *drops = s_ring_drops;
++}
++
 +void fm_modulator_pwm_info(uint32_t *top, uint32_t *div, uint32_t *csr) {
 +    *top = pwm_hw->slice[FM_PWM_SLICE].top;
 +    *div = pwm_hw->slice[FM_PWM_SLICE].div;
@@ -907,8 +941,10 @@ index 0000000..7d38273
 +            s_ring[head] = out;
 +            s_ring_head = next;
 +            s_rx_frames++;
++        } else {
++            // ring full -> drop sample (host clock slightly ahead)
++            s_ring_drops++;
 +        }
-+        // else: ring full -> drop sample (host clock slightly ahead)
 +    }
 +    return true;
 +}
@@ -1029,10 +1065,10 @@ index 0000000..7d38273
 +#endif // MICROPY_HW_FM_TRANSMITTER
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.h b/ports/rp2/fm_transmitter/fm_modulator.h
 new file mode 100644
-index 0000000..21178f9
+index 0000000..e6a94f0
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,146 @@
 +/*
 + * fm_modulator.h
 + *
@@ -1157,6 +1193,15 @@ index 0000000..21178f9
 +// 48000 ticks/s and 48000 frames/s while streaming is the expected balance.
 +void fm_modulator_get_counters(uint32_t *isr_ticks, uint32_t *rx_frames);
 +
++// Ring-buffer health counters (host-clock vs PWM-clock drift):
++//   underflows - empty-ring ticks while the host is streaming; the last
++//                sample is repeated (hold-last), so these are inaudible
++//                drift events rather than clicks; the counter is the trace
++//   drops      - host samples discarded because the ring was full
++// Both are zero at a perfect clock match and grow at the crystal offset
++// (about samples_per_second = 48000 * ppm * 1e-6).
++void fm_modulator_get_ring_stats(uint32_t *underflows, uint32_t *drops);
++
 +// Read the actual PWM slice registers used for the 48kHz sample clock.
 +void fm_modulator_pwm_info(uint32_t *top, uint32_t *div, uint32_t *csr);
 +
@@ -1218,10 +1263,10 @@ index 0000000..2f58f4a
 +target_link_libraries(usermod INTERFACE usermod_pico_fm)
 diff --git a/ports/rp2/fm_transmitter/modpico_fm.c b/ports/rp2/fm_transmitter/modpico_fm.c
 new file mode 100644
-index 0000000..e2a04bc
+index 0000000..b97b205
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/modpico_fm.c
-@@ -0,0 +1,562 @@
+@@ -0,0 +1,579 @@
 +/*
 + * modpico_fm.c
 + *
@@ -1470,6 +1515,22 @@ index 0000000..e2a04bc
 +    return mp_obj_new_tuple(2, tuple);
 +}
 +static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_diag_obj, mod_pico_fm_diag);
++
++// pico_fm.ring_stats() -> (underflows, drops): host-clock vs PWM-clock drift.
++// An underflow is an empty-ring tick while the host is streaming; the last
++// sample is repeated (hold-last) so it is inaudible, and this counter is the
++// only trace of it.  A drop is a host sample discarded because the ring was
++// full.  Both grow at ~48000 * ppm * 1e-6 per second of clock offset.
++static mp_obj_t mod_pico_fm_ring_stats(void) {
++    uint32_t underflows, drops;
++    fm_modulator_get_ring_stats(&underflows, &drops);
++    mp_obj_t tuple[2] = {
++        mp_obj_new_int_from_uint(underflows),
++        mp_obj_new_int_from_uint(drops),
++    };
++    return mp_obj_new_tuple(2, tuple);
++}
++static MP_DEFINE_CONST_FUN_OBJ_0(mod_pico_fm_ring_stats_obj, mod_pico_fm_ring_stats);
 +
 +// pico_fm.pwm_info() -> (top, div, csr, clk_sys_hz) of the 48kHz PWM slice.
 +// Expected: TOP=999, DIV=0x0100, clk_sys=48000000.
@@ -1770,6 +1831,7 @@ index 0000000..e2a04bc
 +    { MP_ROM_QSTR(MP_QSTR_samples), MP_ROM_PTR(&mod_pico_fm_samples_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_ready), MP_ROM_PTR(&mod_pico_fm_ready_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_diag), MP_ROM_PTR(&mod_pico_fm_diag_obj) },
++    { MP_ROM_QSTR(MP_QSTR_ring_stats), MP_ROM_PTR(&mod_pico_fm_ring_stats_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_pwm_info), MP_ROM_PTR(&mod_pico_fm_pwm_info_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_pwm_ctr), MP_ROM_PTR(&mod_pico_fm_pwm_ctr_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_isr_cost), MP_ROM_PTR(&mod_pico_fm_isr_cost_obj) },

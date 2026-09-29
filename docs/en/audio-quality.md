@@ -123,8 +123,8 @@ amplifies defect 2.)
   free-runs 48000 samples/s off its own crystal;
 - the consumer is PWM slice 7, `48 MHz / 1000`, derived from the RP2040's
   12 MHz crystal;
-- there is **no asynchronous sample-rate conversion (ASRC)** between them and no
-  drift counter.
+- there is **no asynchronous sample-rate conversion (ASRC)** between them;
+  the drift counters were added in change 4 (§4).
 
 ```
   ppm    time to hit    glitch rate      glitches in 600s
@@ -165,7 +165,9 @@ host cannot compute the **residual** ripple after loop filtering (that needs the
 loop bandwidth and a phase-noise measurement), so only the computable step is
 given here; the residual is left to hardware measurement.
 
-### L2 ring-buffer observability (P2)
+### L2 ring-buffer observability (P2, fixed by change 4 in §4)
+
+Before:
 
 - on an empty ring `fm_pwm_wrap_handler()` sets `s_cur_sample = 0` → the
   carrier parks on fc for that tick (a dropout) instead of holding the last
@@ -361,6 +363,44 @@ already several times full scale and about to be hard-clipped by the limiter;
 the unsaturated y is still returned to the limiter, so the `clips` counter
 keeps working.
 
+### Change 4: hold-last on underflow + drop/underflow counters (L1/L2)
+
+- `fm_modulator.c`: an empty ring no longer always zeroes the sample. While
+  the host is streaming (`s_audio_active`) and the empty run is shorter than
+  480 ticks (10 ms), the previous sample is repeated (hold-last) and counted
+  in `s_ring_underflows`. A longer empty run means the host really stopped, so
+  the carrier still parks on fc (the original "host paused = exactly on fc"
+  behaviour is preserved).
+- a full ring now increments the new `s_ring_drops` (it used to be a silent
+  drop).
+- exposed as `pico_fm.ring_stats() -> (underflows, drops)`; `diag` and
+  `status` print them (on older firmware `diag` says the interface is
+  missing).
+
+```
+Asynchronous sample-clock drift (same counters; policy-independent)
+  ppm    time to hit    glitch rate      counters: underflows / drops
+  -100   427 s          4.80             833 / 0
+  -50    853 s          2.40             0 / 0
+  50     853 s          2.40             0 / 0
+  100    427 s          4.80             0 / 881
+
+Audible effect of a drift event (1 kHz sine, -6 dBFS, through the DSP chain)
+  ppm      worst |dy| hold  worst |dy| zero  THD zero     THD hold
+  10       5898             22993                0.016%    0.007%
+  50       7053             27591                0.035%    0.008%
+  100      7053             27591                0.064%    0.012%
+  clean    5898             -                        -    0.007%
+```
+
+The event *count* is identical (the counter proves the drift happens), but
+after the change each event no longer produces a 4-5x larger step and the
+THD returns to the drift-free value.
+
+Note: the counters only make the drift *visible*, they do not correct it;
+hold-last removes the click, not the timing error. A real fix is an ASRC or a
+UAC1 feedback endpoint (see the upgrade path below).
+
 ### Before/after (`audio_quality.py compare`)
 
 | Metric | Before | After |
@@ -373,15 +413,19 @@ keeps working.
 | 1 kHz loud-level THD | 17.86 % | **0.008 %** |
 | 10 kHz full-scale THD | 0.76 % | **0.000 %** |
 | band-limit with pre-emphasis off | none (0.00 dB) | 20 kHz −34.7 dB |
+| worst step on an underflow | 27591 | **7053** |
+| THD during underflows | 0.035 % | **0.008 %** |
+| drop/underflow observability | no counters | `pico_fm.ring_stats()` |
 
 ## 5. Remaining work
 
 | Item | Status |
 |---|---|
-| L1/L2: hold-last on underflow + drop/underflow counters | task-3 |
+| L1/L2: hold-last + drop/underflow counters | **done (change 4)**; residual: no ASRC / feedback endpoint, so the drift still exists |
 | L5: default `refdiv 2` on every band | task-4 |
 | L6: real dB mapping for the UAC1 volume | task-4 |
 | limiter look-ahead | not implemented (gain is programme-dependent; change 1 already removed the main pseudo-distortion source) |
+| ASRC / UAC1 feedback endpoint | not implemented (needs ISR budget or TinyUSB feedback support; a structural change) |
 
 ---
 

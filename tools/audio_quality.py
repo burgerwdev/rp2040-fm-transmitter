@@ -453,6 +453,52 @@ def cmd_limiter(a):
     print()
 
 
+def _ring_sim(ppm, seconds, ring):
+    """1 ms-resolution model of the SPSC ring; returns (underflows, drops).
+
+    producer = host USB 48 kHz clock * (1 + ppm/1e6), consumer = exactly
+    48 kHz.  Same counters the firmware now maintains.
+    """
+    per_ms = FS / 1000.0
+    fill = ring // 2.0
+    under = drops = 0
+    frac = 0.0
+    for _ in range(int(seconds * 1000)):
+        frac += per_ms * (1 + ppm * 1e-6)
+        n = int(frac)
+        frac -= n
+        space = (ring - 1) - fill
+        if n > space:
+            drops += int(n - space)
+            fill = ring - 1
+        else:
+            fill += n
+        if fill >= per_ms:
+            fill -= per_ms
+        else:
+            under += int(round(per_ms - fill))
+            fill = 0.0
+    return under, drops
+
+
+def _artifact(ppm, policy, secs=4.0, f=1000.0, amp=16000):
+    """Inject one drift event every 1e6/ppm samples, run the DSP chain, and
+    measure the worst sample-to-sample step and the THD.
+
+    policy "zero" = the old behaviour (s_cur_sample = 0 on an empty ring);
+    policy "hold" = repeat the previous sample (the new behaviour).
+    """
+    n = int(FS * secs)
+    x = np.rint(amp * np.sin(2 * np.pi * f * np.arange(n) / FS)).astype(np.int64)
+    period = int(round(1e6 / abs(ppm))) if ppm else 0
+    if period:
+        for i in range(period, n, period):
+            x[i] = 0 if policy == "zero" else x[i - 1]
+    ch = NewChain(preemph=True, tc_us=75)
+    y = ch.run(x)
+    return int(np.max(np.abs(np.diff(y)))), thd(y[FS:], f)
+
+
 def cmd_drift(a):
     """Asynchronous producer (USB host clock) vs consumer (RP2040 PWM) drift."""
     ring = a.ring
@@ -460,41 +506,57 @@ def cmd_drift(a):
     init = ring // 2
     print("Asynchronous sample-clock drift through the %d-sample ring" % ring)
     print("  producer = host USB 48 kHz clock, consumer = PWM 48 kHz from the")
-    print("  RP2040 crystal.  No resampler, no feedback endpoint, no counter.")
+    print("  RP2040 crystal.  No resampler and no feedback endpoint, so the two")
+    print("  free-running crystals drift forever; the ring only delays the event.")
     print("  ppm > 0: host clock faster (ring fills -> drops); < 0: slower.")
     print()
-    print("  %-6s %-14s %-16s %-16s" % (
-        "ppm", "time to hit", "glitch rate", "glitches in %.0fs" % secs))
-    print("  %-6s %-14s %-16s %-16s" % (
-        "", "the limit", "(samples/s)", ""))
+    print("  Ring health counters over a %.0f s run.  These are policy-" % secs)
+    print("  independent: the firmware counts the same events either way, so the")
+    print("  counter proves the drift is happening / is fixed.")
+    print("  %-6s %-14s %-16s %s" % (
+        "ppm", "time to hit", "glitch rate", "counters: underflows / drops"))
+    print("  %-6s %-14s %s" % ("", "the limit", "(samples/s)"))
     for ppm in (-100, -50, -25, -10, 10, 25, 50, 100):
-        rate = FS * abs(ppm) * 1e-6          # samples/s of imbalance
+        rate = FS * abs(ppm) * 1e-6
         t_hit = init / rate
-        total = max(0.0, rate * (secs - t_hit))
-        print("  %-6d %-14s %-16.2f %-16.0f" % (
-            ppm, "%.0f s" % t_hit, rate, total))
+        u, d = _ring_sim(ppm, secs, ring)
+        print("  %-6d %-14s %-16.2f %d / %d" % (
+            ppm, "%.0f s" % t_hit, rate, u, d))
     print()
-    print("  Ring depth = %d samples = %.1f ms of buffering; the ring starts" % (
+    print("  Ring depth = %d samples = %.1f ms of buffering; it starts centred," % (
         ring, 1000.0 * ring / FS))
-    print("  centred, so it absorbs %.0f s of drift at 25 ppm before the first" % (
+    print("  so it absorbs %.0f s of drift at 25 ppm before the first event." % (
         init / (FS * 25e-6)))
-    print("  glitch.  After that the glitch continues at the imbalance rate")
-    print("  forever - two free-running crystals never re-lock.")
     print()
-    print("  What a glitch is, in the current code:")
-    print("   - ring empty -> s_cur_sample = 0: the carrier parks on fc for")
-    print("     that tick (a dropout), instead of holding the last sample;")
-    print("   - ring full  -> the host sample is dropped silently (a click).")
-    print("  Neither event increments any counter, so `diag` cannot show it.")
+
+    base_step, base_thd = _artifact(0, "hold")
+    print("  Audible effect of the drift events (1 kHz sine, -6 dBFS, through the")
+    print("  current DSP chain; 4 s window):")
+    print("  %-8s %-16s %-16s %-12s %s" % (
+        "ppm", "worst |dy| hold", "worst |dy| zero", "THD zero", "THD hold"))
+    for ppm in (10, 25, 50, 100):
+        hs, ht = _artifact(ppm, "hold")
+        zs, zt = _artifact(ppm, "zero")
+        print("  %-8d %-16d %-16d %9.3f%% %8.3f%%" % (ppm, hs, zs, zt * 100,
+                                                          ht * 100))
+    print("  %-8s %-16d %-16s %9s %8.3f%%" % (
+        "clean", base_step, "-", "-", base_thd * 100))
     print()
-    print("  Worked example, %.0f s at +50 ppm (host faster):" % secs)
-    produced = int(FS * secs * (1 + 50e-6))
-    consumed = int(FS * secs)
-    print("    produced %d samples, consumed %d -> net +%d" % (
-        produced, consumed, produced - consumed))
-    print("    ring capacity %d -> %d dropped samples, first at ~%.0f s" % (
-        ring - 1, max(0, produced - consumed - (ring - 1 - init)),
-        (ring - 1 - init) / (FS * 50e-6)))
+    print("  Reading: with hold-last the worst sample-to-sample step stays at the")
+    print("  clean-signal value (a duplicated sample only advances the waveform")
+    print("  by one sample), while zeroing injects a near-full-scale step on every")
+    print("  event.  The counters show the same number of events in both cases:")
+    print("  the fix changes the bite, not the count.")
+    print()
+    print("  Residual limits and upgrade path:")
+    print("   - the counters make the drift visible but do not correct it, and")
+    print("     hold-last removes the click, not the timing error")
+    print("   - a real fix is an asynchronous sample-rate converter (ASRC) or a")
+    print("     UAC1 feedback endpoint so the host tracks the PWM clock; both are")
+    print("     larger changes (ISR budget / TinyUSB feedback support)")
+    print("   - a cheaper middle ground is to trim the ring in software, dropping")
+    print("     or duplicating one sample with linear interpolation whenever the")
+    print("     fill crosses 50%: that removes the event class, not just its bite")
     print()
     return None
 

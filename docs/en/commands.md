@@ -29,7 +29,7 @@ All values are in Hz unless noted. Type `help` in the console anytime.
 | `ledpin ws2812 [pin]` | Use a WS2812 NeoPixel (default GPIO16) | `ledpin ws2812` |
 | `vbar` | Audio level meter (~50fps): peak bar, squelch threshold (T marker) and clip rate; shows "silent" (slow refresh) while the input is quiet; any key exits | `vbar` |
 | `ring` | Ring buffer fill % | `ring` |
-| `diag` | Measured ISR/RX rates over 1 s (both ~48000) | `diag` |
+| `diag` | Measured ISR/RX rates over 1 s (both ~48000) plus the ring drift counters (underflow/drop) | `diag` |
 | `pwm` | PWM/ISR diagnostics | `pwm` |
 | `pll` | PLL diagnostics (ready/range/last written freq) | `pll` |
 | `sweep [lo hi step]` | Pause audio and sweep the carrier (PLL self-test) | `sweep 87000000 88500000 500000` |
