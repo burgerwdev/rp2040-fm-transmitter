@@ -10,5 +10,6 @@ RP2040 FM Transmitter **v0.23.1** — documentation index.
 | Console command reference（指令使用指南） | [en/commands.md](en/commands.md) | [zh/commands.md](zh/commands.md) |
 | Technical architecture（技术文档） | [en/technical.md](en/technical.md) | [zh/technical.md](zh/technical.md) |
 | Troubleshooting（故障排查） | [en/troubleshooting.md](en/troubleshooting.md) | [zh/troubleshooting.md](zh/troubleshooting.md) |
+| Audio-quality layer audit（音质分层审计） | [en/audio-quality.md](en/audio-quality.md) | [zh/audio-quality.md](zh/audio-quality.md) |
 
 Each page links to its counterpart in the other language (top of page).
