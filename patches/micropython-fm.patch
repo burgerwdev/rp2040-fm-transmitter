@@ -118,10 +118,10 @@ index 0000000..16e3340
 +LED,GPIO25
 diff --git a/ports/rp2/fm_transmitter/fm_modulator.c b/ports/rp2/fm_transmitter/fm_modulator.c
 new file mode 100644
-index 0000000..28b6077
+index 0000000..7d38273
 --- /dev/null
 +++ b/ports/rp2/fm_transmitter/fm_modulator.c
-@@ -0,0 +1,871 @@
+@@ -0,0 +1,905 @@
 +/*
 + * fm_modulator.c
 + *
@@ -190,14 +190,31 @@ index 0000000..28b6077
 +// shows the mute state for `audio off` too.
 +static volatile bool s_audio_route_on;
 +
-+// Audio quality processing state (15kHz LPF + 50/75us pre-emphasis +
-+// limited pre-emphasis + soft limiter).
++// Second-order band-limit section: Chebyshev type I, 0.2 dB passband ripple,
++// Q15 coefficients, direct form II transposed.  Designed and verified by
++// tools/design_filters.py (Q15 quantisation error < 0.05 dB; peak internal
++// state at full scale ~3.3e4, far below int32).
++//   wideband:   order 4, fc = 15 kHz   -> two second-order sections
++//   narrowband: order 2, fc = 3.4 kHz  -> one section
++typedef struct {
++    int32_t b0, b1, b2, a1, a2;   // Q15, a0 = 1
++    int32_t s1, s2;
++} fm_biquad_t;
++
++static fm_biquad_t s_bq_w0 = { 20188, 40377, 20188, 25338, 22648, 0, 0 };
++static fm_biquad_t s_bq_w1 = {  9684, 19368,  9684,  1777,  4191, 0, 0 };
++static fm_biquad_t s_bq_n0 = {  2540,  5080,  2540, -37018, 14411, 0, 0 };
++
++static inline void fm_biquad_reset(fm_biquad_t *q) {
++    q->s1 = 0;
++    q->s2 = 0;
++}
++
++// Audio quality processing state (see fm_audio_process below).
 +static volatile bool s_preemphasis_enabled;
 +static volatile uint16_t s_preemph_us;  // pre-emphasis time constant: 50/75/300 us
-+static int32_t s_lp15;                  // first 15 kHz band-limit LP state
-+static int32_t s_lp75;                  // pre-emphasis LP state (2.1/3.2 kHz)
-+static int32_t s_lp75_a;                // pre-emphasis coefficient (Q15)
-+static int32_t s_lp15b;                 // second band-limit LP (limited pre-emphasis)
++static int32_t s_pre_g_q10;             // pre-emphasis G = tau*fs (Q10)
++static int32_t s_pre_x1;                // pre-emphasis differentiator x[n-1]
 +static int32_t s_dcb_xprev;             // DC blocker (2 Hz high-pass) state
 +static int32_t s_dcb_yprev;
 +static int32_t s_hp_xprev;              // NFM 300 Hz high-pass state
@@ -235,15 +252,48 @@ index 0000000..28b6077
 +// Defined here (before fm_modulator_init) so the init code can reference them.
 +// ---------------------------------------------------------------------------
 +
-+#define FM_LP15_A_Q15   (28168)  // a = 1 - exp(-2*pi*15000/48000)  (15kHz LP)
-+#define FM_LP3K_A_Q15   (10644)  // a = 1 - exp(-2*pi*3000/48000)   (3kHz LP)
 +#define FM_HP300_A_Q15  (31509)  // a = exp(-2*pi*300/48000)        (300Hz HP)
-+#define FM_LP75_A_Q15   (7953)   // a = 1 - exp(-1/(75us*48000))    (2.1kHz LP)
-+#define FM_LP50_A_Q15   (11169)  // a = 1 - exp(-1/(50us*48000))    (3.2kHz LP)
-+#define FM_LP300_A_Q15  (2199)   // a = 1 - exp(-1/(300us*48000))   (530Hz LP)
-+#define FM_PREEMPH_G_Q10 (5120)  // shelf gain 5.0 (~ +14dB)        (Q10)
 +#define FM_DCB_A_Q15    (9)      // 2 Hz DC blocker: a = 2*pi*2/48000
 +#define FM_LIM_SOFT     (26214)  // soft-knee entry, 80% of full scale
++
++// Standard FM pre-emphasis H(f) = |1 + j*2*pi*f*tau|, implemented as the
++// first difference y = x + G*(x - x[n-1]) with G = tau*fs (Q10).  This is the
++// exact curve the receiver's de-emphasis inverts (the old code used a fixed
++// +14 dB shelf, which produced a +8.6 dB midrange hump and -6.3 dB at 15 kHz).
++#define FM_PRE_50_G_Q10   (2458)   //  50 us -> tau*fs =  2.4
++#define FM_PRE_75_G_Q10   (3686)   //  75 us -> tau*fs =  3.6
++#define FM_PRE_300_G_Q10  (14746)  // 300 us -> tau*fs = 14.4
++
++// The band-limit is applied whether or not pre-emphasis is enabled; the
++// coefficients live next to the fm_biquad_t definition above.
++
++// One biquad step: y = H(z)*x with H = (b0 + b1 z^-1 + b2 z^-2) /
++// (1 + a1 z^-1 + a2 z^-2), direct form II transposed (2 states per section).
++//
++// The input and the feedback term are bounded to int16 range so every product
++// stays safely inside int32: the largest |a1|/|b1| is 40377 (Q15) and
++// 40377 * 32767 = 1.3e9 < 2^31.  Without the bound a full-scale broadband
++// input rings the section to |y| ~ 1e5 and a1*y overflows (UB).  The section
++// only saturates when the signal is already several times full scale, i.e.
++// where the limiter below clips anyway; the unclamped y is still returned so
++// the limiter's clip counter keeps working.
++static inline int32_t fm_biquad_run(fm_biquad_t *q, int32_t x) {
++    if (x > 32767) {
++        x = 32767;
++    } else if (x < -32768) {
++        x = -32768;
++    }
++    int32_t y = ((q->b0 * x) >> 15) + q->s1;
++    int32_t yf = y;
++    if (yf > 32767) {
++        yf = 32767;
++    } else if (yf < -32768) {
++        yf = -32768;
++    }
++    q->s1 = ((q->b1 * x) >> 15) - ((q->a1 * yf) >> 15) + q->s2;
++    q->s2 = ((q->b2 * x) >> 15) - ((q->a2 * yf) >> 15);
++    return y;
++}
 +
 +// ---------------------------------------------------------------------------
 +// 48 kHz sample clock: fires once per PWM wrap.
@@ -352,10 +402,11 @@ index 0000000..28b6077
 +    s_audio_route_on = false;
 +    s_preemphasis_enabled = true;
 +    s_preemph_us = 75;
-+    s_lp15 = 0;
-+    s_lp75 = 0;
-+    s_lp75_a = FM_LP75_A_Q15;
-+    s_lp15b = 0;
++    s_pre_g_q10 = FM_PRE_75_G_Q10;
++    s_pre_x1 = 0;
++    fm_biquad_reset(&s_bq_w0);
++    fm_biquad_reset(&s_bq_w1);
++    fm_biquad_reset(&s_bq_n0);
 +    s_dcb_xprev = 0;
 +    s_dcb_yprev = 0;
 +    s_hp_xprev = 0;
@@ -449,12 +500,11 @@ index 0000000..28b6077
 +// Chain, applied to every mono sample before it is enqueued:
 +//   1. 2 Hz DC blocker              (keep the FM centre exactly on carrier)
 +//   2. sq <threshold> weak-sample mute (optional: zeroes faint stream noise)
-+//   3. 15 kHz one-pole low-pass     (band-limit like broadcast FM)
-+//   4. 50/75 us pre-emphasis        (high shelf; the FM radio's de-emphasis
-+//                                    otherwise dulls the treble)
-+//   5. second 15 kHz low-pass       (limited pre-emphasis: tames the boosted
-+//                                    high-frequency noise before the limiter)
-+//   6. soft-knee limiter            (prevent over-deviation distortion)
++//   3. standard pre-emphasis        (75/50/300 us first difference; the FM
++//                                    radio's de-emphasis is its exact inverse)
++//   4. band-limit                   (4th-order Chebyshev 0.5 dB at 15 kHz
++//                                    wideband, 2nd-order at 3.4 kHz narrowband)
++//   5. soft-knee limiter            (prevent over-deviation distortion)
 +//
 +// Silence needs no gate: a zero sample (paused, muted or sq-zeroed) parks
 +// the carrier exactly on fc, so a radio tuned to fc outputs silence.
@@ -465,12 +515,6 @@ index 0000000..28b6077
 +
 +// Process one mono sample: returns the sample to transmit.
 +static int16_t fm_audio_process(int16_t x) {
-+    // Narrowband voice-band low-pass coefficient: on narrowband (handheld
-+    // radio) bands the audio is limited to ~3kHz instead of 15kHz, matching
-+    // the channel and the receiver's audio band (deviation is not wasted on
-+    // content the radio filters out anyway).
-+    int32_t lp_a = s_nfm_audio ? FM_LP3K_A_Q15 : FM_LP15_A_Q15;
-+
 +    // DC blocker (2 Hz one-pole high-pass): removes any DC offset in the
 +    // incoming stream so the average frequency stays exactly on the carrier.
 +    int32_t dcb = s_dcb_yprev + (x - s_dcb_xprev) - ((s_dcb_yprev * FM_DCB_A_Q15) >> 15);
@@ -508,40 +552,32 @@ index 0000000..28b6077
 +        }
 +    }
 +
-+    if (!s_preemphasis_enabled) {
-+        if (s_nfm_audio) {
-+            // The channel low-pass still applies without pre-emphasis.
-+            int32_t lp = s_lp15 + ((lp_a * (int32_t)(x - s_lp15)) >> 15);
-+            s_lp15 = lp;
-+            x = (int16_t)lp;
++    // Standard pre-emphasis (75/50/300 us): first difference, y = x + G*dx.
++    // The previous sample is tracked even while disabled so toggling it back
++    // on does not inject a step transient.
++    int32_t pre_d = (int32_t)x - s_pre_x1;
++    s_pre_x1 = x;
++    if (s_preemphasis_enabled) {
++        int32_t pre = (int32_t)x + ((s_pre_g_q10 * pre_d) >> 10);
++        if (pre > 32767) {
++            pre = 32767;
++        } else if (pre < -32768) {
++            pre = -32768;
 +        }
-+        return x;
++        x = (int16_t)pre;
 +    }
 +
-+    // Band-limit low-pass (15kHz broadcast / 3kHz narrowband).
-+    int32_t lp15 = s_lp15 + ((lp_a * (int32_t)(x - s_lp15)) >> 15);
-+    s_lp15 = lp15;
-+
-+    // 50/75 us pre-emphasis: high-pass component scaled and added back.
-+    int32_t lp75 = s_lp75 + ((s_lp75_a * (lp15 - s_lp75)) >> 15);
-+    s_lp75 = lp75;
-+    int32_t y = lp15 + (((lp15 - lp75) * FM_PREEMPH_G_Q10) >> 10);
-+
-+    // Clamp the pre-emphasised signal back to int16 before the second
-+    // low-pass: the pre-emphasis shelf gain (5x) can push y past +/-196000,
-+    // and (y - lp15b) * FM_LP15_A_Q15 would overflow int32 (-> audible
-+    // garbage / constant clipping on loud material).
-+    if (y > 32767) {
-+        y = 32767;
-+    } else if (y < -32768) {
-+        y = -32768;
++    // Band-limit (always, also when pre-emphasis is off): 4th-order
++    // Chebyshev at 15 kHz, or 2nd-order at 3.4 kHz in narrowband voice mode.
++    // It follows the pre-emphasis so the boosted high-frequency noise is
++    // removed again before the limiter sees it.
++    int32_t y;
++    if (s_nfm_audio) {
++        y = fm_biquad_run(&s_bq_n0, x);
++    } else {
++        y = fm_biquad_run(&s_bq_w0, x);
++        y = fm_biquad_run(&s_bq_w1, y);
 +    }
-+
-+    // Limited pre-emphasis: re-apply the band-limit low-pass so the boosted
-+    // high-frequency noise does not hammer the limiter.
-+    int32_t lp15b = s_lp15b + ((lp_a * (y - s_lp15b)) >> 15);
-+    s_lp15b = lp15b;
-+    y = lp15b;
 +
 +    // Soft-knee limiter: linear below 80% full scale, 2:1 compression above,
 +    // hard clip as the final safety net.
@@ -564,10 +600,8 @@ index 0000000..28b6077
 +void fm_modulator_set_preemphasis(bool enable) {
 +    if (s_preemphasis_enabled != enable) {
 +        s_preemphasis_enabled = enable;
-+        // Reset the filter state on any change.
-+        s_lp15 = 0;
-+        s_lp75 = 0;
-+        s_lp15b = 0;
++        // The differentiator state stays valid across the toggle (it tracks
++        // x[n-1] either way), so only the flag has to change.
 +    }
 +}
 +
@@ -604,8 +638,10 @@ index 0000000..28b6077
 +    if (s_nfm_audio != nfm) {
 +        s_hp_xprev = 0;
 +        s_hp_yprev = 0;
-+        s_lp15 = 0;
-+        s_lp15b = 0;
++        // Reset the newly selected band-limit so its history does not leak.
++        fm_biquad_reset(&s_bq_n0);
++        fm_biquad_reset(&s_bq_w0);
++        fm_biquad_reset(&s_bq_w1);
 +    }
 +    s_nfm_audio = nfm;
 +}
@@ -619,18 +655,16 @@ index 0000000..28b6077
 +// on the coefficient.  300us is the handheld-radio (voice) standard.
 +void fm_modulator_set_preemphasis_us(uint16_t us) {
 +    if (us == 50) {
-+        s_lp75_a = FM_LP50_A_Q15;
++        s_pre_g_q10 = FM_PRE_50_G_Q10;
 +        s_preemph_us = 50;
 +    } else if (us == 300) {
-+        s_lp75_a = FM_LP300_A_Q15;
++        s_pre_g_q10 = FM_PRE_300_G_Q10;
 +        s_preemph_us = 300;
 +    } else {
-+        s_lp75_a = FM_LP75_A_Q15;
++        s_pre_g_q10 = FM_PRE_75_G_Q10;
 +        s_preemph_us = 75;
 +    }
-+    s_lp15 = 0;
-+    s_lp75 = 0;
-+    s_lp15b = 0;
++    // The differentiator has no coefficient-dependent state to reset.
 +}
 +
 +uint16_t fm_modulator_get_preemphasis_us(void) {

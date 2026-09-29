@@ -148,6 +148,103 @@ def sine(f, n, amp):
     return np.rint(amp * np.sin(2 * np.pi * f * t)).astype(np.int64)
 
 
+# --- improved chain (fm_modulator.c after the audio-quality rework) ---------
+FM_PRE_G_Q10 = {50: 2458, 75: 3686, 300: 14746}
+FM_BQ = {
+    "wide": [(20188, 40377, 20188, 25338, 22648),
+             (9684, 19368, 9684, 1777, 4191)],
+    "nfm": [(2540, 5080, 2540, -37018, 14411)],
+}
+
+
+def biquad_run(q, x):
+    """C fm_biquad_run(): q = [b0,b1,b2,a1,a2,s1,s2] (Q15 coefficients).
+
+    Input and feedback are bounded to int16 range (exactly as the C does) so
+    the products cannot overflow int32.
+    """
+    if x > 32767:
+        x = 32767
+    elif x < -32768:
+        x = -32768
+    b0, b1, b2, a1, a2, s1, s2 = q
+    y = ((b0 * x) >> 15) + s1
+    yf = 32767 if y > 32767 else (-32768 if y < -32768 else y)
+    q[5] = ((b1 * x) >> 15) - ((a1 * yf) >> 15) + s2
+    q[6] = ((b2 * x) >> 15) - ((a2 * yf) >> 15)
+    return y
+
+
+class NewChain:
+    """Replica of fm_audio_process() after the audio-quality rework:
+    DC block -> 300 Hz HP (nfm) -> pre-emphasis -> band-limit -> limiter."""
+
+    def __init__(self, preemph=True, tc_us=75, nfm=False, squelch=0):
+        self.preemph = preemph
+        self.nfm = nfm
+        self.squelch = squelch
+        self.clips = 0
+        self.pre_g = FM_PRE_G_Q10.get(tc_us, FM_PRE_G_Q10[75])
+        self.pre_x1 = 0
+        self.dcb_xprev = self.dcb_yprev = 0
+        self.hp_xprev = self.hp_yprev = 0
+        kind = "nfm" if nfm else "wide"
+        self.bq = [[*c, 0, 0] for c in FM_BQ[kind]]
+
+    def process(self, x):
+        dcb = i32(self.dcb_yprev + (x - self.dcb_xprev)
+                  - ((self.dcb_yprev * FM_DCB_A_Q15) >> 15))
+        self.dcb_xprev = x
+        self.dcb_yprev = dcb
+        if dcb > 32767:
+            dcb = 32767
+        elif dcb < -32768:
+            dcb = -32768
+        x = i16(dcb)
+
+        if self.nfm:
+            hp = (FM_HP300_A_Q15 * (x + self.hp_yprev - self.hp_xprev)) >> 15
+            self.hp_xprev = x
+            self.hp_yprev = hp
+            if hp > 32767:
+                hp = 32767
+            elif hp < -32768:
+                hp = -32768
+            x = i16(hp)
+
+        if self.squelch and abs(x) < self.squelch:
+            x = 0
+
+        pre_d = x - self.pre_x1
+        self.pre_x1 = x
+        if self.preemph:
+            pre = x + ((self.pre_g * pre_d) >> 10)
+            if pre > 32767:
+                pre = 32767
+            elif pre < -32768:
+                pre = -32768
+            x = pre
+
+        y = x
+        for q in self.bq:
+            y = biquad_run(q, y)
+
+        if y > FM_LIM_SOFT:
+            y = FM_LIM_SOFT + ((y - FM_LIM_SOFT) >> 1)
+        elif y < -FM_LIM_SOFT:
+            y = -FM_LIM_SOFT + ((y + FM_LIM_SOFT) >> 1)
+        if y > 32767:
+            y = 32767
+            self.clips += 1
+        elif y < -32768:
+            y = -32768
+            self.clips += 1
+        return i16(y)
+
+    def run(self, xs):
+        return np.array([self.process(int(v)) for v in xs], dtype=np.int64)
+
+
 def tone_db(y, f):
     """Amplitude of the f-Hz component of y, in dB relative to full scale."""
     n = len(y)
@@ -217,6 +314,90 @@ def cmd_resp(a):
     print("   - the +14 dB shelf ceiling (20*log10(5)) vs the standard 75us")
     print("     curve (20*log10(15000/2122) = +17.0 dB at 15 kHz)")
     print("   - preemph off + wideband = NO band-limit at all (see the report)")
+    return None
+
+
+def _resp(make, freqs, amp, secs=2):
+    ch = make()
+    out = {}
+    for f in freqs:
+        x = sine(f, secs * FS, amp)
+        y = ch.run(x)
+        out[f] = tone_db(y[FS:], f) - tone_db(x[FS:], f)
+    return out
+
+
+def _ideal_deemph_db(f, tc_us):
+    return 10 * np.log10(1 + (2 * np.pi * f * tc_us * 1e-6) ** 2)
+
+
+def cmd_compare(a):
+    """Before/after for the audio-quality rework (task-2)."""
+    bl = [1000, 5000, 8000, 10000, 12000, 14000, 15000, 16000, 18000,
+          20000, 23000]
+    amp = 800  # small enough that the limiter never engages
+
+    old_bl = _resp(lambda: Chain(lponly=True), bl, amp)
+    new_bl = _resp(lambda: NewChain(preemph=False), bl, amp)
+    print("Band-limit response (pre-emphasis off; dB re input)")
+    print("  %-8s %10s %10s %10s" % ("f (Hz)", "old 1p x2", "new cheby", "delta"))
+    for f in bl:
+        print("  %-8d %10.2f %10.2f %+10.2f" % (
+            f, old_bl[f], new_bl[f], new_bl[f] - old_bl[f]))
+    print("  passband |droop| at 10 kHz: old %.2f dB -> new %.2f dB" % (
+        -old_bl[10000], -new_bl[10000]))
+    print("  stopband at 23 kHz:         old %.2f dB -> new %.2f dB" % (
+        old_bl[23000], new_bl[23000]))
+    print()
+
+    print("Net received response (transmit - standard receiver de-emphasis);")
+    print("this is what the listener hears.  0 dB = correct tone.")
+    print("  %-8s %10s %10s %10s" % ("f (Hz)", "old 75us", "new 75us", "delta"))
+    old = _resp(lambda: Chain(preemph=True, tc_us=75), bl, amp)
+    new = _resp(lambda: NewChain(preemph=True, tc_us=75), bl, amp)
+    for f in bl:
+        o = old[f] - _ideal_deemph_db(f, 75)
+        n = new[f] - _ideal_deemph_db(f, 75)
+        print("  %-8d %10.2f %10.2f %+10.2f" % (f, o, n, n - o))
+    worst_old = max(abs(old[f] - _ideal_deemph_db(f, 75)) for f in bl
+                    if f <= 15000)
+    worst_new = max(abs(new[f] - _ideal_deemph_db(f, 75)) for f in bl
+                    if f <= 15000)
+    print("  worst |error| in 0.3-15 kHz: old %.2f dB -> new %.2f dB" % (
+        worst_old, worst_new))
+    print()
+
+    print("Harmonic distortion (THD %%, 1 s, harmonics 2..10)")
+    print("  %-6s %-8s %10s %10s" % ("tone", "level", "old 75us", "new 75us"))
+    for f in (1000, 5000, 10000):
+        for lvl, label in ((4000, "linear"), (20000, "loud"), (32000, "over")):
+            o = Chain(preemph=True, tc_us=75)
+            n = NewChain(preemph=True, tc_us=75)
+            x = sine(f, FS, lvl)
+            to = thd(o.run(x)[FS // 2:], f)
+            tn = thd(n.run(x)[FS // 2:], f)
+            print("  %-6d %-8s %9.3f%% %9.3f%%" % (f, label, to * 100, tn * 100))
+    print()
+
+    print("Transient / limiter (step 0 -> 30000)")
+    step = np.concatenate([np.zeros(FS // 2), np.full(FS // 2, 30000)])
+    for name, ch in (("old", Chain(preemph=True, tc_us=75)),
+                     ("new", NewChain(preemph=True, tc_us=75))):
+        y = ch.run(step)
+        i = FS // 2
+        print("  %-4s samples above knee in first 200: %d, clips: %d, peak: %d" % (
+            name, int(np.sum(np.abs(y[i:i + 200]) > FM_LIM_SOFT)), ch.clips,
+            int(np.max(np.abs(y)))))
+    print()
+
+    print("Wideband chain with pre-emphasis disabled (the old code had NO")
+    print("band-limit on this path):")
+    print("  %-8s %10s %10s" % ("f (Hz)", "old off", "new off"))
+    oo = _resp(lambda: Chain(preemph=False), [15000, 20000, 23000], amp)
+    nn = _resp(lambda: NewChain(preemph=False), [15000, 20000, 23000], amp)
+    for f in (15000, 20000, 23000):
+        print("  %-8d %10.2f %10.2f" % (f, oo[f], nn[f]))
+    print()
     return None
 
 
@@ -324,7 +505,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     for name, fn in (("resp", cmd_resp), ("thd", cmd_thd),
-                     ("limiter", cmd_limiter), ("drift", cmd_drift)):
+                     ("limiter", cmd_limiter), ("drift", cmd_drift),
+                     ("compare", cmd_compare)):
         p = sub.add_parser(name)
         p.set_defaults(func=fn)
 
