@@ -38,8 +38,28 @@ firmware uses a unique identity (0x1209:0xFA50). If leftover devices appear:
 - Run `diag` — the ISR must be ≈48000/s (lower = starved IRQ, update firmware);
 - A/B with `pre off`; try `dev 40000`;
 - Keep the PC volume at 60–80% to avoid constant limiting;
-- Occasional clicks come from host/local clock drift in synchronous USB audio —
-  expected.
+- clicks after a long listen: the USB host clock and the PWM sample clock are
+  not the same source.  This firmware now repeats the previous sample on an
+  underflow and counts it — watch the Underflows/Drops deltas in `diag` (a
+  delta of 0 means the two crystals happen to match).  A growing count means a
+  ppm-level offset: the audible click is gone, but removing the timing error
+  entirely needs an ASRC or a UAC1 feedback endpoint.
+
+## Upload tool picks the wrong serial port
+
+With several ttyACM devices attached (e.g. the ADALM-Pluto's own serial
+console) `tools/upload.sh` / `tools/serial.sh` resolve the board by its USB ID
+**1209:fa50** instead of taking the first port.  To force one:
+
+```bash
+FM_PORT=/dev/ttyACM1 tools/upload.sh
+./tools/serial.sh /dev/ttyACM1
+tools/pico_port.sh                 # print the resolved port, or list candidates
+```
+
+`could not enter raw repl` with a login prompt or garbage captured means the
+wrong port was picked (check with `tools/pico_port.sh`); note there is no CDC
+port at all in BOOTSEL mode.
 
 ## Common mistakes
 

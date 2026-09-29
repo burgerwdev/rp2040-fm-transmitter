@@ -34,7 +34,25 @@
 - `diag` 确认 ISR ≈48000/s（低于此 = 中断饿死，更新固件）；
 - `pre off` 对比（预加重+限幅过激可能削波）；`dev 40000` 收窄频偏；
 - 电脑音量 60~80%，避免持续顶限幅器；
-- 偶发咔嗒：同步 USB 音频模式下主机/本地时钟微小漂移所致，属正常现象。
+- 长时间播放后出现咔嗒：USB 主机与 PWM 采样时钟不同源，本固件已改为
+  「欠载重复上一采样」并计数，用 `diag` 看 Underflows/Drops 增量即可判断（增量为
+  0 表示两颗晶振刚好匹配）；计数持续增长说明存在 ppm 级漂移——听感已改善，
+  但彻底消除需要 ASRC 或 UAC1 反馈端点。
+
+## 上传脚本找不到板子 / 选错了串口
+
+机上同时插了多块 ttyACM 设备（如 ADALM-Pluto 自带的串口控制台）时，
+`tools/upload.sh` / `tools/serial.sh` 会按 USB ID **1209:fa50** 定位开发板，
+不会误选。手动指定：
+
+```bash
+FM_PORT=/dev/ttyACM1 tools/upload.sh
+./tools/serial.sh /dev/ttyACM1
+tools/pico_port.sh                 # 只打印解析到的端口，或列出候选设备
+```
+
+报 `could not enter raw repl` 且捕获到别的登录提示或乱码，通常就是选错了
+端口（用 `tools/pico_port.sh` 确认）；另外 BOOTSEL 模式下没有 CDC 端口。
 
 ## 常见误用
 

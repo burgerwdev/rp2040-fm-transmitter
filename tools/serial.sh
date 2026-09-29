@@ -19,18 +19,16 @@
 #
 # Install tio (auto-reconnect):  sudo pacman -S tio
 #
-# Usage: ./serial.sh [device]    (default: /dev/pico, else first /dev/ttyACM*)
+# Usage: ./serial.sh [device]    (default: the board's CDC port, resolved by
+#                                 tools/pico_port.sh from USB IDs 1209:fa50,
+#                                 falling back to /dev/pico)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${1:-}"
 if [ -z "${PORT}" ]; then
-    if [ -e /dev/pico ]; then
-        PORT=/dev/pico
-    else
-        PORT="$(ls /dev/ttyACM* 2>/dev/null | head -1 || true)"
-    fi
+    PORT="$("${SCRIPT_DIR}/pico_port.sh")" || exit 1
 fi
-[ -n "${PORT}" ] || { echo "error: no serial port (/dev/pico or /dev/ttyACM*); is the Pico plugged in?"; exit 1; }
+[ -n "${PORT}" ] || { echo "error: no serial port; is the Pico plugged in?" >&2; exit 1; }
 
 if command -v tio >/dev/null 2>&1; then
     echo "==> tio ${PORT} @115200 (auto-reconnects on Pico reboots; Ctrl-T Q to quit)"

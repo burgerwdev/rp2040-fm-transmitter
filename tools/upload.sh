@@ -8,27 +8,44 @@
 #   "could not enter raw repl" (the console swallows the handshake).
 #
 # This script:
-#   1. opens the USB CDC port, probes the REPL state by sending CR (Enter)
-#      and watching for the prompt:
+#   1. resolves the board's CDC port by its USB IDs (tools/pico_port.sh,
+#      1209:fa50) so another ttyACM device - a PlutoSDR, an ST-Link, a
+#      second Pico - cannot be picked by mistake;
+#   2. opens that port, probes the REPL state by sending CR (Enter) and
+#      watching for the prompt:
 #        "fm> "  -> the FM console is up: send `exit` (retried) so it
 #                   returns to the plain MicroPython REPL;
 #        ">>> "  -> already at the plain REPL: nothing to do;
 #      a leftover raw-REPL state (from a previous mpremote session) is
 #      exited with Ctrl-B first;
-#   2. uploads main.py with `mpremote resume fs cp` (resume = no soft reset,
-#      so the console does not grab the REPL again);
-#   3. resets the board with machine.reset() so the new main.py runs.
+#   3. uploads main.py with `mpremote connect <port> resume fs cp`
+#      (resume = no soft reset, so the console does not grab the REPL again);
+#   4. resets the board with machine.reset() so the new main.py runs.
 #
 # Works in all states: console up, plain REPL, raw REPL leftover, or no
 # main.py yet (first boot).
 #
-# Usage: ./upload.sh [path-to-main.py]
+# Usage: ./upload.sh [--port /dev/ttyACMx] [path-to-main.py]
+#        FM_PORT=/dev/ttyACMx ./upload.sh
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="${1:-$(dirname "${SCRIPT_DIR}")/python/main.py}"
+
+PORT_OPT=""
+SRC=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--port) PORT_OPT="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) SRC="$1"; shift ;;
+    esac
+done
+SRC="${SRC:-$(dirname "${SCRIPT_DIR}")/python/main.py}"
 
 command -v mpremote >/dev/null 2>&1 || { echo "error: mpremote not found (pip install mpremote)"; exit 1; }
 [ -f "${SRC}" ] || { echo "error: not found: ${SRC}"; exit 1; }
+
+PORT="$(FM_PORT="${PORT_OPT}" "${SCRIPT_DIR}/pico_port.sh")" || exit 1
+echo "==> board port: ${PORT}"
 
 # Use the same Python interpreter mpremote runs on (it is guaranteed to have
 # pyserial, which the console-exit step needs).
@@ -36,23 +53,15 @@ MPY="$(head -1 "$(command -v mpremote)" | sed 's/^#!//')"
 
 # 1. Probe the REPL state and ask the FM console (if running) to exit.
 echo "==> probing the REPL state..."
-"${MPY}" - <<'EOF'
-import glob, sys, time
+"${MPY}" - "${PORT}" <<'EOF'
+import sys, time
 import serial
 
-port = None
-for p in sorted(glob.glob('/dev/ttyACM*')) + sorted(glob.glob('/dev/ttyUSB*')):
-    try:
-        s = serial.Serial(p, 115200, timeout=0.2)
-        port = p
-        break
-    except Exception:
-        continue
-
-if port is None:
-    sys.exit("error: no Pico serial port found (/dev/ttyACM*) - is it plugged in?")
-
-print("   port: %s" % port)
+port = sys.argv[1]
+try:
+    s = serial.Serial(port, 115200, timeout=0.2)
+except Exception as e:
+    sys.exit("error: cannot open %s: %s" % (port, e))
 
 def drain(sec):
     end = time.time() + sec
@@ -107,11 +116,11 @@ EOF
 
 # 2. Upload without a soft reset (the board is at the plain REPL now).
 echo "==> uploading $(basename "${SRC}") to :main.py"
-mpremote resume fs cp "${SRC}" :main.py
+mpremote connect "${PORT}" resume fs cp "${SRC}" :main.py
 
 # 3. Reset so the new main.py runs.  The USB port vanishes mid-reset, which
 #    makes mpremote throw an OSError (expected - the board is rebooting).
 echo "==> resetting the board (USB port will briefly vanish)..."
-mpremote resume exec "import machine; machine.reset()" >/dev/null 2>&1 || true
+mpremote connect "${PORT}" resume exec "import machine; machine.reset()" >/dev/null 2>&1 || true
 
 echo "==> done - the new main.py is running. Open a serial terminal (115200)."
